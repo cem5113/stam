@@ -1,0 +1,2 @@
+# stam
+suc tahmin modeli
