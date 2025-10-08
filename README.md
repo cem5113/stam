@@ -1,2 +1,2 @@
-# stam
+# sutam
 suc tahmin modeli
