@@ -5,8 +5,12 @@ import numpy as np
 from typing import Optional, Dict, Any, List
 
 # Paket içi importlar
-from .baseline import BaselineModel, fit_mean_by_groups, predict_mean_by_groups
-from .uncertainty import add_poisson_uncertainty  # istersen add_uncertainty_and_labels'a da genişletebilirsin
+from .baseline import (
+    BaselineModel,
+    fit_mean_by_groups, predict_mean_by_groups,
+    fit_frequency_baseline, predict_expected_baseline,
+)
+from .uncertainty import add_poisson_uncertainty, lambda_to_p_occ
 
 # ---------------------------------------------------------------------
 # Yardımcılar
@@ -82,55 +86,56 @@ class HurdleLikeModel:
         return out
 
 # ---------------------------------------------------------------------
-# 2) Genel tahmin güvence katmanı
+# 2) Tahmin kolonlarını güvenceye alan fonksiyon
 # ---------------------------------------------------------------------
-def ensure_predictions(df_raw: pd.DataFrame) -> pd.DataFrame:
+def ensure_predictions(
+    df_raw: pd.DataFrame,
+    model: Optional[Dict] = None,
+    horizon_days: int = 90,
+) -> pd.DataFrame:
     """
-    Girdi DataFrame’ine aşağıdaki kolonları **mümkün olduğunca** ekler:
-      - pred_p_occ (0..1)
-      - pred_expected (>=0) varsa belirsizlik: pred_q10, pred_q50, pred_q90
-    Yoksa: BaselineModel ile 'p_proxy' üretir ve bunu 'pred_p_occ' olarak kullanır.
+    Veri üzerinde tahmin kolonlarını **güvenle** üretir/tamamlar:
+      - pred_expected (λ̂)  : yoksa frekans-baseline ile çıkarılır
+      - pred_p_occ    (0..1): yoksa 1 - exp(-λ̂)
+      - pred_q10/q50/q90    : yoksa Poisson kantilleri eklenir
+    Zaten var olan kolonlara dokunmaz, eksikleri tamamlar.
     """
     df = df_raw.copy()
 
-    # 1) Zaten beklenen değer varsa → Poisson belirsizliği ekle
-    if "pred_expected" in df.columns:
+    # 1) λ̂ yoksa, frekans-temelli baseline ile üret
+    if "pred_expected" not in df.columns:
+        mdl = model or fit_frequency_baseline(df, horizon_days=horizon_days)
+        df["pred_expected"] = predict_expected_baseline(df, mdl)
+
+    # 2) P(occurrence) yoksa λ̂ → p
+    if "pred_p_occ" not in df.columns and "pred_expected" in df.columns:
+        df["pred_p_occ"] = lambda_to_p_occ(df["pred_expected"].values)
+
+    # 3) Kantiller/güvenlik: q10/q50/q90 yoksa ekle (ve eksikse p_occ de tamamlar)
+    if not {"pred_q10", "pred_q50", "pred_q90"}.issubset(df.columns) and "pred_expected" in df.columns:
         df = add_poisson_uncertainty(df, lam_col="pred_expected")
-        return df
-
-    # 2) Yalnızca olasılık varsa → normalle ve dön
-    if "pred_p_occ" in df.columns:
-        df["pred_p_occ"] = pd.to_numeric(df["pred_p_occ"], errors="coerce").clip(0, 1)
-        return df
-
-    # 3) Hiçbiri yoksa: Baseline fallback (p_proxy)
-    if "GEOID" in df.columns:
-        base = BaselineModel(window_days=7, use_hour=True).fit(df)
-        df = base.predict(df)
-        if "p_proxy" in df.columns:
-            df["pred_p_occ"] = df["p_proxy"].clip(0, 1)
-    else:
-        # GEOID yoksa herkese 0 atanır (emin değilsek konservatif)
-        df["pred_p_occ"] = 0.0
 
     return df
 
+# ---------------------------------------------------------------------
+# 3) Genel Predictor (fallback'lı)
+# ---------------------------------------------------------------------
 class Predictor:
     """
-    Gelecekte gerçek model (checkpoint/artifact) bağlanınca bu sınıf genişletilir.
+    Gelecekte gerçek model (checkpoint/artifact) bağlanınca genişletilir.
     Şimdilik:
       - ensure_predictions(df) ile tahmin kolonlarını garanti eder.
-      - Gerekirse BaselineModel ile p_proxy üretir.
+      - Gerekirse BaselineModel ile p_proxy üretir (λ̂ yoksa ayrı).
     """
     def __init__(self) -> None:
         self._baseline = BaselineModel(window_days=7, use_hour=True)
 
     def predict(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        # Eğer girişte tahmin kolonları varsa (veya pred_expected) bunları tamamla.
-        if _has_predictions(df_raw):
+        # Eğer girişte tahmin kolonları (veya λ̂) varsa → eksikleri tamamla
+        if _has_predictions(df_raw) or ("pred_expected" in df_raw.columns):
             return ensure_predictions(df_raw)
 
-        # baseline’ı fit → predict
+        # Hiç tahmin yoksa: p_proxy (olasilik proxy) ile minimal çıktı
         self._baseline.fit(df_raw)
         out = self._baseline.predict(df_raw)
         if "p_proxy" in out.columns:
