@@ -9,7 +9,7 @@ import pandas as pd
 # ============================================================
 # 0) Saha-dostu kısa etiketler (kural tabanlı açıklama için)
 # ============================================================
-_LABELS = {
+_LABELS: Dict[str, str] = {
     "nr_7d": "Yakın tekrar (7g)",
     "nr_14d": "Yakın tekrar (14g)",
     "nei_7d_sum": "Komşu yoğunluğu (7g)",
@@ -26,13 +26,16 @@ _LABELS = {
     "event_hour": "Saat etkisi",
 }
 
-# Saat dilimine basit risk ağırlığı (18–02 daha riskli farz ediliyor)
-_HOUR_WEIGHT = {h: (1.0 if 18 <= h <= 23 or 0 <= h <= 2 else 0.4) for h in range(24)}
+# 18–02 saatleri nispeten yüksek risk farz edilir (yer tutucu ağırlık)
+_HOUR_WEIGHT: Dict[int, float] = {h: (1.0 if 18 <= h <= 23 or 0 <= h <= 2 else 0.4) for h in range(24)}
 
 def _val(row: dict, k: str, default: float = 0.0) -> float:
     v = row.get(k, default)
     try:
-        return float(v) if v is not None and str(v) != "nan" else default
+        f = float(v)
+        if math.isnan(f):
+            return default
+        return f
     except Exception:
         return default
 
@@ -71,7 +74,7 @@ def brief_xai_for_row(row: dict) -> List[Dict]:
     # 4) POI / çevre
     poi = max(_val(row, "poi_risk_score"), _val(row, "poi_risk_score_range"))
     if poi > 0:
-        feats.append({"name": _LABELS.get("poi_risk_score_range"), "score": 0.7 * poi, "why": "Riskli POI yoğunluğu etkili."})
+        feats.append({"name": _LABELS["poi_risk_score_range"], "score": 0.7 * poi, "why": "Riskli POI yoğunluğu etkili."})
 
     # 5) Toplu taşıma
     bus = _val(row, "bus_stop_count")
@@ -86,7 +89,7 @@ def brief_xai_for_row(row: dict) -> List[Dict]:
     if 0 <= hr <= 23:
         feats.append({"name": _LABELS["event_hour"], "score": 2.0 * _HOUR_WEIGHT.get(hr, 0.4), "why": f"Saat {hr:02d}:00 dilimi görece riskli."})
 
-    # 7) Hava
+    # 7) Hava (opsiyonel)
     precip = _val(row, "precip")
     if precip > 0:
         feats.append({"name": _LABELS["precip"], "score": 0.3 * precip, "why": "Yağış, belirli suç tiplerini etkileyebilir."})
@@ -266,7 +269,7 @@ def fit_global_explainer(df_raw: pd.DataFrame, cat_k: int = 8, l2: float = 1e-3)
     }
 
 def _format_reason(name: str, meta: pd.DataFrame) -> str:
-    if name in meta.index and isinstance(meta.loc[name, "label"], str):
+    if isinstance(meta, pd.DataFrame) and name in meta.index and isinstance(meta.loc[name, "label"], str):
         return meta.loc[name, "label"]
     if name.startswith("dow_"):
         return f"Gün: {_dow_name(int(name.split('_')[1]))}"
@@ -301,7 +304,8 @@ def explain_rows(df_raw: pd.DataFrame, model: Dict, topk: int = 3) -> pd.DataFra
     top_vals:  List[List[float]] = []
     reasons:   List[str] = []
 
-    meta_idx = model["meta"] if isinstance(model.get("meta"), pd.DataFrame) else pd.DataFrame()
+    meta_idx = model.get("meta")
+    meta_df = meta_idx if isinstance(meta_idx, pd.DataFrame) else pd.DataFrame()
 
     for i in range(X.shape[0]):
         idxs = np.argsort(-abs_contrib[i])[:max(1, int(topk))]
@@ -313,7 +317,7 @@ def explain_rows(df_raw: pd.DataFrame, model: Dict, topk: int = 3) -> pd.DataFra
         parts = []
         for nm, v in zip(names, vals):
             sign = "↑" if v >= 0 else "↓"
-            parts.append(f"{_format_reason(nm, meta_idx)} ({sign})")
+            parts.append(f"{_format_reason(nm, meta_df)} ({sign})")
         reasons.append(" • ".join(parts))
 
     out = pd.DataFrame({
