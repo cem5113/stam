@@ -4,7 +4,9 @@ from typing import Dict, Tuple, Optional, List, Iterable
 import numpy as np
 import pandas as pd
 
-from models.uncertainty import poisson_quantiles, prob_at_least_one
+# ÖNCEKİ: from models.uncertainty import poisson_quantiles, prob_at_least_one
+# DÜZELTME: paket içi bağıl import
+from .uncertainty import poisson_quantiles, prob_at_least_one
 
 # ---------------------------------------------------------------------
 # Yardımcılar
@@ -255,6 +257,7 @@ class BaselineModel:
             self.table_geo_hour = pd.DataFrame(columns=["GEOID", "event_hour", "hour_weight"])
             return self
 
+    # ...
         g = (dsub.groupby("GEOID", as_index=False)[y].sum()
                  .rename(columns={y: "recent_sum"}))
         mx = float(g["recent_sum"].max() or 1.0)
