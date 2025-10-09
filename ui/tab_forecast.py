@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from typing import Tuple, Optional
+from features.near_repeat import compute_temp_hotspot, compute_stable_hotspot
 
 from config.settings import RISK_THRESHOLDS
 from dataio.loaders import load_sf_crime_latest
@@ -106,6 +107,60 @@ def render():
         layer_temp   = st.checkbox("Geçici hotspot", True)
         layer_stable = st.checkbox("Kalıcı hotspot", True)
 
+    # --- hotspot skorları
+    temp_df = compute_temp_hotspot(df, window_days=2, baseline_days=30)
+    stab_df = compute_stable_hotspot(df, horizon_days=90)
+    
+    # --- harita katmanı oluştururken:
+    geo_last = agg.groupby("GEOID", as_index=False)[score_col].max()
+    centroids = df_raw.groupby("GEOID", as_index=False)[[lat_col, lon_col]].first()
+    view = centroids.merge(geo_last, on="GEOID", how="left")
+    
+    # katman veri kaynakları (opsiyonel)
+    view_temp = view.merge(temp_df, on="GEOID", how="left").dropna(subset=["temp_score"])
+    view_stab = view.merge(stab_df, on="GEOID", how="left").dropna(subset=["stable_score"])
+    
+    layers = [{
+        "@@type": "ScatterplotLayer",
+        "data": view.to_dict("records"),
+        "get_position": f"[{lon_col}, {lat_col}]",
+        "get_radius": 80,
+        "pickable": True,
+        "opacity": 0.7,
+        "get_fill_color": "[255, (1-level)*200, (1-level)*100]"  # risk katmanı
+    }]
+    
+    if layer_temp and len(view_temp) > 0:
+        layers.append({
+            "@@type": "ScatterplotLayer",
+            "data": view_temp.to_dict("records"),
+            "get_position": f"[{lon_col}, {lat_col}]",
+            "get_radius": 110,
+            "pickable": True,
+            "opacity": 0.35,
+            "get_fill_color": "[255, 140, 0]"  # turuncu: geçici hotspot
+        })
+    
+    if layer_stable and len(view_stab) > 0:
+        layers.append({
+            "@@type": "ScatterplotLayer",
+            "data": view_stab.to_dict("records"),
+            "get_position": f"[{lon_col}, {lat_col}]",
+            "get_radius": 60,
+            "pickable": True,
+            "opacity": 0.35,
+            "get_fill_color": "[0, 128, 255]"  # mavi: kalıcı hotspot
+        })
+    
+    st.pydeck_chart({
+        "initialViewState": {"latitude": float(view[lat_col].mean()),
+                             "longitude": float(view[lon_col].mean()),
+                             "zoom": 11},
+        "layers": layers,
+        "mapProvider": "carto"
+    })
+
+    
     # Veri hazırlığı (pencereye göre)
     df = df_raw.copy()
     if cat_col and len(pick_cats) > 0:
@@ -200,6 +255,13 @@ def render():
         st.dataframe(topk, use_container_width=True)
         st.caption("Seviyeler: Yüksek / Orta / Düşük • Güven: q10–q90 yayılımından türetilir (varsa).")
 
+        st.download_button(
+            "⬇️ Top-10 CSV",
+            data=topk.to_csv(index=False).encode("utf-8"),
+            file_name="top10_geoid.csv",
+            mime="text/csv"
+        )
+                
         st.markdown("**Seçili GEOID detay (örnek)**")
         pick = st.selectbox("GEOID seç", topk["GEOID"] if "GEOID" in topk.columns else [])
         if pick:
@@ -207,5 +269,16 @@ def render():
             cols = [c for c in ["date","event_hour","crime_count","pred_p_occ","pred_q10","pred_q50","pred_q90","pred_expected"] if c in sub.columns]
             with st.expander(f"{pick} – Son kayıtlar", expanded=False):
                 st.dataframe(sub[cols].tail(30), use_container_width=True)
+            if pick:
+                sub_daily = (
+                    sub.assign(day=sub["date"].dt.date)
+                       .groupby("day", as_index=False)[score_col].sum()
+                    if "date" in sub.columns else None
+                )
+                if sub_daily is not None and len(sub_daily) > 0:
+                    sub_daily = sub_daily.sort_values("day").tail(14)
+                    st.line_chart(sub_daily.set_index("day")[score_col])
+                else:
+                    st.caption("Trend için yeterli tarih verisi yok.")
 
     st.caption("🧪 Bu sekme iskeleti: katman anahtarları ve XAI kısa notları sonraki adımda popup/sağ panelde gösterilecek.")
