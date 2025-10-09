@@ -1,42 +1,69 @@
-# services/auth.py
+# services/logging.py
 from __future__ import annotations
-import os
-from typing import Literal
+from pathlib import Path
+import os, json, uuid, hashlib
+from typing import Any, Dict, Optional
 
-Role = Literal["Amir", "Kullanıcı"]
+from services.tz import now_sf
 
-_ROLES = ("Amir", "Kullanıcı")
+# Ortam değişkenleriyle özelleştirilebilir
+LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
+AUDIT_PATH = LOG_DIR / os.environ.get("AUDIT_FILE", "audit.jsonl")
 
-def get_role() -> Role:
-    """Öncelik: Streamlit session_state → ENV(APP_ROLE) → 'Kullanıcı'."""
-    try:
-        import streamlit as st  # yalnızca varsa
-        r = st.session_state.get("role")
-        if r in _ROLES:
-            return r  # type: ignore
-    except Exception:
-        pass
-    r_env = os.environ.get("APP_ROLE", "Kullanıcı")
-    return r_env if r_env in _ROLES else "Kullanıcı"  # type: ignore
-
-def set_role(role: Role) -> None:
+def _session_id() -> str:
+    """Her Streamlit oturumu için kısa bir UID üret/hatırla."""
     try:
         import streamlit as st
-        st.session_state["role"] = role
+        return st.session_state.setdefault("_sid", uuid.uuid4().hex[:12])
     except Exception:
-        os.environ["APP_ROLE"] = role  # CLI/başka ortam için
+        # UI dışında çağrılırsa tek seferlik üret
+        return uuid.uuid4().hex[:12]
 
-def can_approve() -> bool:
-    return get_role() == "Amir"
+def _event_id(event: str, payload: Dict[str, Any], ts: str) -> str:
+    """Kayıt için kısa, stabil bir kimlik üret (12 hex)."""
+    s = json.dumps({"e": event, "p": payload, "t": ts},
+                   sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
-def role_selector_in_sidebar(default: Role = "Kullanıcı") -> Role:
-    """Streamlit varsa sidebar’da rol seçici render eder; seçimi döndürür."""
+def audit(event: str,
+          actor: Optional[str] = None,
+          payload: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Append-only JSONL denetim kaydı.
+    Dönüş: event_id (hata durumunda boş string).
+    """
     try:
-        import streamlit as st
-        cur = get_role() or default
-        role = st.sidebar.selectbox("Rol", _ROLES, index=_ROLES.index(cur))
-        set_role(role)  # persist
-        st.sidebar.caption("Rol: Amir → onay/yetki; Kullanıcı → yalnız görüntüleme.")
-        return role  # type: ignore
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = now_sf().isoformat(timespec="seconds")
+        payload = payload or {}
+        rec = {
+            "event_id": _event_id(event, payload, ts),
+            "ts_sf": ts,
+            "session": _session_id(),
+            "event": event,
+            "actor": actor or "-",
+            "payload": payload,
+        }
+        with AUDIT_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return rec["event_id"]
     except Exception:
-        return get_role()
+        # Log yazılamazsa uygulamayı durdurma
+        return ""
+
+def tail(limit: int = 100) -> list[dict]:
+    """Son N denetim kaydını döndür."""
+    if not AUDIT_PATH.exists():
+        return []
+    rows: list[dict] = []
+    with AUDIT_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows[-limit:]
+
+# Geriye dönük uyumluluk
+def tail_audit(limit: int = 100) -> list[dict]:
+    return tail(limit)
