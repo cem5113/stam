@@ -335,6 +335,14 @@ def render():
             mime="text/csv"
         )
 
+        # --- Planlamaya gönder köprüsü (Top-K) ---
+        colA, colB = st.columns(2)
+        if colA.button("➡️ Planlamaya gönder (Top-K)", use_container_width=True):
+            st.session_state["plan_geoids_seed"] = [str(g) for g in (topk["GEOID"].astype(str) if "GEOID" in topk.columns else [])]
+            st.success("Top-K GEOID, Devriye Planlama sekmesine aktarıldı. '🚓 Devriye Planlama' sekmesine geçin.")
+
+        # (alt tarafta zaten 'Seçili GEOID detay' var)
+
         st.markdown("**Seçili GEOID detay**")
         pick = st.selectbox("GEOID seç", topk["GEOID"] if "GEOID" in topk.columns else [])
         if pick is not None and "GEOID" in df.columns:
@@ -366,6 +374,15 @@ def render():
                     s30 = sub[sub["date"] >= dmax - pd.Timedelta(days=30)]["crime_count"].sum()
                     st.metric("Son 7 gün", int(s7))
                     st.metric("Son 30 gün", int(s30))
+
+            # Seçileni planlamaya ekle
+            if st.button("➕ Bu GEOID'i planlamaya ekle", use_container_width=True):
+                st.session_state.setdefault("plan_geoids_seed", [])
+                seed = [str(x) for x in st.session_state["plan_geoids_seed"]]
+                if str(pick) not in seed:
+                    seed.append(str(pick))
+                st.session_state["plan_geoids_seed"] = seed
+                st.success(f"GEOID {pick} planlamaya eklendi. '🚓 Devriye Planlama' sekmesine geçin.")
 
             # İlk 3 etken (XAI) — varsa
             if brief_xai_for_row is not None and len(sub) > 0:
