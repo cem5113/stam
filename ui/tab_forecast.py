@@ -9,6 +9,12 @@ from config.settings import RISK_THRESHOLDS
 from dataio.loaders import load_sf_crime_latest
 from services.tz import now_sf_str
 
+# Opsiyonel XAI (varsa kullan)
+try:
+    from models.xai import brief_xai_for_row
+except Exception:
+    brief_xai_for_row = None
+
 # (Varsa) geçici/kalıcı hotspot fonksiyonlarını kullan; yoksa sessizce atla
 try:
     from features.near_repeat import compute_temp_hotspot, compute_stable_hotspot
@@ -24,12 +30,12 @@ def _pick_category_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 def _risk_level_from_p(p: float) -> str:
-    if p is None or np.isnan(p):
+    if p is None or (isinstance(p, float) and np.isnan(p)):
         return "Bilinmiyor"
     return "Yüksek" if p > RISK_THRESHOLDS["mid"] else ("Orta" if p > RISK_THRESHOLDS["low"] else "Düşük")
 
 def _confidence_label(q10: float, q90: float) -> str:
-    if np.isnan(q10) or np.isnan(q90):
+    if q10 is None or q90 is None or np.isnan(q10) or np.isnan(q90):
         return "—"
     spread = float(q90) - float(q10)
     if spread <= 0.5:  return "Yüksek güven"
@@ -239,7 +245,7 @@ def render():
         st.markdown("**Tahmin Haritası**")
         lat_col, lon_col = _latlon_columns(df_raw)
         if lat_col and lon_col and "GEOID" in df_raw.columns:
-            # GEOID → tekil koordinat (ilk/ortalama)
+            # GEOID → tekil koordinat (ortalama)
             centroids = (
                 df_raw.groupby("GEOID", as_index=False)[[lat_col, lon_col]]
                 .mean(numeric_only=True)
@@ -275,7 +281,7 @@ def render():
             # Geçici hotspot
             if layer_temp and compute_temp_hotspot is not None:
                 try:
-                    temp_df = compute_temp_hotspot(df_raw, window_days=2, baseline_days=30)  # beklenen: GEOID, temp_score
+                    temp_df = compute_temp_hotspot(df_raw, window_days=2, baseline_days=30)  # GEOID, temp_score
                     if temp_df is not None and "GEOID" in temp_df.columns:
                         view_temp = view.merge(temp_df, on="GEOID", how="left").dropna(subset=["temp_score"])
                         if len(view_temp) > 0:
@@ -294,7 +300,7 @@ def render():
             # Kalıcı hotspot
             if layer_stable and compute_stable_hotspot is not None:
                 try:
-                    stab_df = compute_stable_hotspot(df_raw, horizon_days=90)  # beklenen: GEOID, stable_score
+                    stab_df = compute_stable_hotspot(df_raw, horizon_days=90)  # GEOID, stable_score
                     if stab_df is not None and "GEOID" in stab_df.columns:
                         view_stab = view.merge(stab_df, on="GEOID", how="left").dropna(subset=["stable_score"])
                         if len(view_stab) > 0:
@@ -328,32 +334,40 @@ def render():
 
     # Sağ panel — Top-K & GEOID detay
     with right:
-        st.markdown("**Top-{} kritik GEOID**".format(int(k_top)))
+        st.markdown(f"**Top-{int(k_top)} kritik GEOID**")
         st.dataframe(topk, use_container_width=True, height=360)
         st.caption("Seviye: Yüksek / Orta / Düşük • Güven: q10–q90 yayılımı (varsa).")
 
         st.download_button(
-            "⬇️ Top-{} CSV".format(int(k_top)),
+            f"⬇️ Top-{int(k_top)} CSV",
             data=topk.to_csv(index=False).encode("utf-8"),
-            file_name="top{}_geoid.csv".format(int(k_top)),
+            file_name=f"top{int(k_top)}_geoid.csv",
             mime="text/csv"
         )
 
         st.markdown("**Seçili GEOID detay**")
         pick = st.selectbox("GEOID seç", topk["GEOID"] if "GEOID" in topk.columns else [])
         if pick is not None and "GEOID" in df.columns:
-            sub = df[df["GEOID"] == pick].copy()
-            # kısa metrikler
+            sub = df[df["GEOID"].astype(str) == str(pick)].copy()
+
+            # P(olay) / Beklenen
             if score_col in ("pred_p_occ", "p_proxy"):
                 p = float(np.nanmean(sub[score_col])) if len(sub) else np.nan
                 st.metric("Tahmin seviyesi", _risk_level_from_p(p))
                 st.metric("Risk skoru (0–1)", f"{p:.2f}" if not np.isnan(p) else "—")
             else:
                 total = float(np.nansum(sub[score_col])) if len(sub) else np.nan
-                norm = 0.0 if np.isnan(total) else total
-                st.metric("Beklenen/Toplam skor", f"{norm:.2f}")
+                st.metric("Beklenen/Toplam skor", f"{(0.0 if np.isnan(total) else total):.2f}")
 
-            # gerçekleşen (varsa)
+            # Güven (q10/q90 varsa, o GEOID için)
+            conf_text = "—"
+            if {"pred_q10", "pred_q90"}.issubset(df.columns):
+                qsub = sub[["pred_q10", "pred_q90"]].dropna()
+                if len(qsub) > 0:
+                    conf_text = _confidence_label(float(qsub["pred_q10"].mean()), float(qsub["pred_q90"].mean()))
+            st.metric("Güven", conf_text)
+
+            # Gerçekleşen (son 7 / 30 gün)
             if "date" in sub.columns:
                 sub["date"] = pd.to_datetime(sub["date"], errors="coerce")
                 dmax = sub["date"].max()
@@ -363,7 +377,16 @@ def render():
                     st.metric("Son 7 gün", int(s7))
                     st.metric("Son 30 gün", int(s30))
 
-            # kısa trend
+            # İlk 3 etken (XAI)
+            if brief_xai_for_row is not None and len(sub) > 0:
+                row = sub.sort_values("date", ascending=False).iloc[0].to_dict() if "date" in sub.columns else sub.iloc[0].to_dict()
+                facts = brief_xai_for_row(row)
+                if facts:
+                    st.markdown("**İlk 3 etken (XAI)**")
+                    for f in facts:
+                        st.markdown(f"- **{f['name']}** — {f['why']}")
+
+            # Kısa trend
             if "date" in sub.columns:
                 sub_day = sub.assign(day=sub["date"].dt.date).groupby("day", as_index=False)[score_col].sum()
                 if len(sub_day) > 0:
