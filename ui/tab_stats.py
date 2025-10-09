@@ -1,12 +1,24 @@
-# ui/tab_stats.py
+# sutam/ui/tab_stats.py
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 
-from dataio.loaders import load_sf_crime_latest
-from features.stats_classic import time_distributions, spatial_top_geoid, offense_breakdown
+# Matplotlib güvenli import
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # headless ortam için backend
+    import matplotlib.pyplot as plt
+except Exception as e:
+    plt = None
+    _mpl_err = e
+
+from sutam.dataio.loaders import load_sf_crime_latest
+from sutam.features.stats_classic import (
+    time_distributions,
+    spatial_top_geoid,
+    offense_breakdown,
+)
 
 # --------- yardımcılar ----------
 def _category_options(df: pd.DataFrame):
@@ -15,11 +27,41 @@ def _category_options(df: pd.DataFrame):
             return c, sorted(df[c].dropna().astype(str).unique())
     return None, []
 
+
 def _latlon_cols(df: pd.DataFrame):
-    for y, x in (("lat", "lon"), ("latitude", "longitude"), ("LAT", "LON"), ("y", "x")):
+    for y, x in (("lat", "lon"), ("latitude", "longitude"),
+                 ("LAT", "LON"), ("y", "x")):
         if y in df.columns and x in df.columns:
             return y, x
     return None, None
+
+
+# --------- Ana render ---------
+def render():
+    if plt is None:
+        st.error(
+            "Grafikler için **matplotlib** gerekli. "
+            "Lütfen `requirements.txt` içine `matplotlib` ekleyip yeniden deploy edin.\n\n"
+            f"Teknik detay: {type(_mpl_err).__name__}: {_mpl_err}"
+        )
+        return
+
+    df = load_sf_crime_latest()
+    if df is None or df.empty:
+        st.warning("Veri yüklenemedi.")
+        return
+
+    st.subheader("📊 Zaman Dağılımları")
+    fig1 = time_distributions(df)
+    st.pyplot(fig1)
+
+    st.subheader("🗺️ Mekânsal Dağılım (Top GEOID)")
+    fig2 = spatial_top_geoid(df)
+    st.pyplot(fig2)
+
+    st.subheader("⚖️ Suç Türleri Dağılımı")
+    fig3 = offense_breakdown(df)
+    st.pyplot(fig3)
 
 def _safe_date_range(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
     # df["date"] varsa min/max; yoksa bugünden son 30 gün varsay
