@@ -1,9 +1,10 @@
-# models/uncertainty.py
+# sutam/models/uncertainty.py
 from __future__ import annotations
 import math
+from typing import Optional, Dict, Iterable, Tuple, List
+
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Iterable, Tuple, List
 
 # ============================================================
 # 0) Olasılık etiketi ve güven etiketi (UI ile uyumlu)
@@ -25,6 +26,7 @@ def risk_level_from_prob(p: float, thresholds: Dict[str, float]) -> str:
     mid = float(thresholds.get("mid", 0.66))
     return "Yüksek" if p > mid else ("Orta" if p > low else "Düşük")
 
+
 def confidence_label(q10: Optional[float], q90: Optional[float]) -> str:
     """
     q10–q90 yayılımından basit güven etiketi.
@@ -38,9 +40,12 @@ def confidence_label(q10: Optional[float], q90: Optional[float]) -> str:
     if np.isnan(a) or np.isnan(b):
         return "—"
     spread = b - a
-    if spread <= 0.5:  return "Yüksek güven"
-    if spread <= 1.5:  return "Orta güven"
+    if spread <= 0.5:
+        return "Yüksek güven"
+    if spread <= 1.5:
+        return "Orta güven"
     return "Düşük güven"
+
 
 def add_confidence_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -53,6 +58,122 @@ def add_confidence_cols(df: pd.DataFrame) -> pd.DataFrame:
         ]
         return out
     return df
+
+
+# ============================================================
+# 1) Poisson yardımcıları (baseline.py tarafından beklenen API)
+# ============================================================
+def prob_at_least_one(lmbda: float) -> float:
+    """
+    P(X >= 1) = 1 - P(X = 0) = 1 - e^{-λ}
+    """
+    try:
+        lam = float(lmbda)
+    except Exception:
+        return np.nan
+    if lam < 0:
+        return np.nan
+    return 1.0 - math.exp(-lam)
+
+
+def _poisson_cdf(k: int, lam: float) -> float:
+    """Kümülatif Poisson CDF (bağımlılıksız, basit hesap)."""
+    s = 0.0
+    # küçük lam'da sorun yok; büyük lam için performans istersen ileride scipy kullanılabilir.
+    for i in range(0, k + 1):
+        s += math.exp(-lam) * (lam ** i) / math.factorial(i)
+    return s
+
+
+def poisson_quantiles(
+    lmbda: float,
+    q_low: float = 0.10,
+    q_high: float = 0.90
+) -> Tuple[int, int]:
+    """
+    Poisson(λ) için yaklaşık alt/üst kuantil (tam-sayı).
+    Varsayılanlar q_low=0.10, q_high=0.90; UI'daki q10/q90 ile uyumlu.
+    """
+    try:
+        lam = float(lmbda)
+        ql = float(q_low)
+        qh = float(q_high)
+    except Exception:
+        return (np.nan, np.nan)  # type: ignore
+
+    if lam < 0 or not (0.0 < ql < qh < 1.0):
+        return (np.nan, np.nan)  # type: ignore
+
+    # alt kuantil
+    k_low = 0
+    while _poisson_cdf(k_low, lam) < ql:
+        k_low += 1
+
+    # üst kuantil
+    k_high = k_low
+    while _poisson_cdf(k_high, lam) < qh:
+        k_high += 1
+
+    return int(k_low), int(k_high)
+
+
+def lambda_to_p_occ(lmbda: float) -> float:
+    """
+    λ → en az bir olay olasılığına dönüştürür (P(X>=1)).
+    baseline/predictor tarafından kullanılır.
+    """
+    return prob_at_least_one(lmbda)
+
+
+def add_poisson_uncertainty(
+    df: pd.DataFrame,
+    lambda_col: str = "pred_mean",
+    out_low_col: str = "pred_q10",
+    out_high_col: str = "pred_q90",
+    p_occ_col: str = "pred_p_occ",
+    q_low: float = 0.10,
+    q_high: float = 0.90,
+    clip_zero: bool = True
+) -> pd.DataFrame:
+    """
+    Bir DataFrame’e Poisson belirsizlik bandı ve gerçekleşme olasılığı sütunları ekler.
+    - lambda_col: λ (beklenen olay sayısı)
+    - out_low_col/out_high_col: kuantil sütun adları (q10/q90 default)
+    - p_occ_col: P(X>=1)
+    """
+    if lambda_col not in df.columns:
+        # Kolon yoksa dokunmadan dön
+        return df
+
+    out = df.copy()
+    lows: List[float] = []
+    highs: List[float] = []
+    p_occs: List[float] = []
+
+    for lam in out[lambda_col].tolist():
+        try:
+            lam_f = float(lam)
+        except Exception:
+            lam_f = np.nan
+
+        if np.isnan(lam_f) or lam_f < 0:
+            lows.append(np.nan)
+            highs.append(np.nan)
+            p_occs.append(np.nan)
+            continue
+
+        if clip_zero and lam_f < 0:
+            lam_f = 0.0
+
+        ql, qh = poisson_quantiles(lam_f, q_low=q_low, q_high=q_high)
+        lows.append(ql)
+        highs.append(qh)
+        p_occs.append(lambda_to_p_occ(lam_f))
+
+    out[out_low_col] = lows
+    out[out_high_col] = highs
+    out[p_occ_col] = p_occs
+    return out
 
 # ============================================================
 # 1) Poisson → P(N>=1) yardımcıları
