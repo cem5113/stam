@@ -1,0 +1,33 @@
+# .github/workflows/sutam_daily_update.yml
+name: SUTAM - Daily Update
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # her gün 02:00 UTC (SF 19:00 için UTC saatini ayarla)
+  workflow_dispatch:       # butondan / API'den manuel tetikleme için şart
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt || true
+
+      - name: Run daily pipeline
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}          # gerekirse
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub’ın otomatik token’ı; çoğu iş için yeter
+        run: |
+          python scripts/daily_pipeline.py
