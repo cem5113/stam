@@ -1,21 +1,22 @@
-# app.py
+# sutam/app.py
 from __future__ import annotations
 import os
 import streamlit as st
 
-from config.settings import APP_NAME
-from dataio.loaders import load_metadata
+# ---- Paket-içi importlar (tamamı mutlak) ----
+from sutam.config.settings import APP_NAME
+from sutam.dataio.loaders import load_metadata
 
 # UI sekmeleri
-from ui.home import render as render_home
-from ui.tab_planning import render as render_planning
-from ui.tab_forecast import render as render_forecast
-from ui.tab_stats import render as render_stats
-from ui.tab_reports import render as render_reports
+from sutam.ui.home import render as render_home
+from sutam.ui.tab_planning import render as render_planning
+from sutam.ui.tab_forecast import render as render_forecast
+from sutam.ui.tab_stats import render as render_stats
+from sutam.ui.tab_reports import render as render_reports
 
 # Servisler
-from services.auth import role_selector_in_sidebar
-from services.logging import audit
+from sutam.services.auth import role_selector_in_sidebar
+from sutam.services.logging import audit
 
 # ---- Sayfa ayarı ----
 st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
@@ -55,21 +56,21 @@ with st.sidebar:
     else:
         st.warning("GH_TOKEN yok • Release/RAW fall-back kullanılacak.")
 
+# ---- Secrets → env (opsiyonel) ----
 try:
-    import os, streamlit as st
     if "GH_TOKEN" in st.secrets:
         os.environ.setdefault("GH_TOKEN", st.secrets["GH_TOKEN"])
         os.environ.setdefault("GITHUB_REPO", st.secrets.get("GITHUB_REPO", "cem5113/crime_prediction_data"))
         os.environ.setdefault("GITHUB_WORKFLOW", st.secrets.get("GITHUB_WORKFLOW", "full_pipeline.yml"))
 
-    # NEW: Uygulama başlığı ve varsayılan rol de secrets'ten gelebilsin
+    # Başlık ve varsayılan rol de secrets'ten gelebilsin
     for k in ("APP_NAME", "APP_ROLE"):
         if k in st.secrets:
             os.environ.setdefault(k, str(st.secrets[k]))
 except Exception:
     pass
 
-# İlk açılış audit
+# ---- İlk açılış audit ----
 audit(event="app_open", actor=role, payload={"tab": "Home"})
 
 # ---- Sekmeler ----
