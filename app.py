@@ -2,6 +2,7 @@
 from __future__ import annotations
 import streamlit as st
 from ui.tab_forecast import render as render_forecast
+from ui.tab_stats import render as render_stats
 
 st.set_page_config(page_title="SUTAM", layout="wide")
 
@@ -30,14 +31,23 @@ with tabs[0]:
     render_home()
 
 with tabs[1]:
-    st.info("Devriye Planlama buraya gelecek (bir sonraki adımda).")
+    st.info("🚧 Devriye Planlama burada olacak (bir sonraki adımda ekleyeceğiz).")
 
 with tabs[2]:
-    render_forecast()
+    try:
+        render_forecast()
+    except Exception as e:
+        st.info("Suç Tahmini modülü henüz hazır değil.")
+        st.exception(e)
 
 with tabs[3]:
-    st.info("Suç İstatistikleri (saat/gün/ay, tür dağılımı) burada.")
+    try:
+        from ui.tab_stats import render as render_stats
+        render_stats()
+    except Exception as e:
+        st.error("Suç İstatistikleri modülü yüklenemedi.")
+        st.exception(e)
 
 with tabs[4]:
-    st.info("Raporlar & Operasyonel Öneriler burada.")
+    st.info("🧾 Raporlar & Operasyonel Öneriler burada olacak.")
 
