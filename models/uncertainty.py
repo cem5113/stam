@@ -5,9 +5,9 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Iterable, Tuple, List
 
-# ------------------------------------------------------------
-# Risk / Güven etiketleri (UI ile uyumlu)
-# ------------------------------------------------------------
+# ============================================================
+# 0) Olasılık etiketi ve güven etiketi (UI ile uyumlu)
+# ============================================================
 def risk_level_from_prob(p: float, thresholds: Dict[str, float]) -> str:
     """
     p: gerçekleşme olasılığı (0..1)
@@ -48,10 +48,55 @@ def add_confidence_cols(df: pd.DataFrame) -> pd.DataFrame:
         return out
     return df
 
-# ------------------------------------------------------------
-# Poisson belirsizlik (kantiller) ve p_occ
-# ------------------------------------------------------------
-# Küçük lambda → kesin CDF; büyük lambda → normal yaklaşımı
+# ============================================================
+# 1) Poisson → P(N>=1) yardımcıları
+# ============================================================
+def lambda_to_p_occ(lam: np.ndarray | float) -> np.ndarray:
+    """Poisson varsayımı: P(N>=1) = 1 - exp(-λ)."""
+    arr = np.asarray(lam, dtype=float)
+    return 1.0 - np.exp(-np.clip(arr, 0.0, None))
+
+# ============================================================
+# 2) Hızlı (vektörel) normal yaklaşımı kantilleri
+#    q ≈ λ + z * sqrt(λ)   (kontinü düzeltme ihmal)
+# ============================================================
+def poisson_normal_quantiles(lam: Iterable[float], qs: Tuple[float, ...] = (0.1, 0.5, 0.9)) -> np.ndarray:
+    """
+    Poisson için hızlı normal yaklaşımı: q ≈ λ + z * sqrt(λ), λ>=0.
+    SciPy olmadan hafif ve vektörel.
+    Dönen: shape (n, len(qs))
+    """
+    lam = np.asarray(list(lam), dtype=float)
+    lam = np.clip(lam, 0.0, None)
+    # z-skorları
+    try:
+        from statistics import NormalDist
+        zs = np.array([NormalDist().inv_cdf(q) for q in qs], dtype=float)
+    except Exception:
+        # Çok nadir: NormalDist yoksa yaklaşıksal sabitler (0.1,0.5,0.9)
+        z_map = {0.1: -1.2815515655, 0.5: 0.0, 0.9: 1.2815515655}
+        zs = np.array([z_map.get(float(q), 0.0) for q in qs], dtype=float)
+    root = np.sqrt(np.maximum(lam, 1e-9))
+    # (len(lam), len(qs)) döndür
+    return np.maximum(0.0, lam[:, None] + root[:, None] * zs[None, :])
+
+def attach_poisson_quantiles(df: pd.DataFrame, lambda_col: str = "pred_expected") -> pd.DataFrame:
+    """
+    df[lambda_col] → df['pred_q10','pred_q50','pred_q90'] ekler (normal yaklaşımı).
+    """
+    if lambda_col not in df.columns:
+        return df
+    qs = poisson_normal_quantiles(df[lambda_col].values, qs=(0.10, 0.50, 0.90))
+    out = df.copy()
+    out["pred_q10"] = qs[:, 0]
+    out["pred_q50"] = qs[:, 1]
+    out["pred_q90"] = qs[:, 2]
+    return out
+
+# ============================================================
+# 3) Daha doğru (küçük λ’larda güvenli) kantiller
+#    Küçük λ → kesin CDF; büyük λ → normal yaklaşımı
+# ============================================================
 _Z = {0.1: -1.2815515655446004, 0.5: 0.0, 0.9: 1.2815515655446004}
 
 def _poisson_pmf(k: int, lam: float) -> float:
@@ -60,7 +105,6 @@ def _poisson_pmf(k: int, lam: float) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 def _poisson_cdf(k: int, lam: float) -> float:
-    # Küçük lam’larda güvenli, büyük lam’da yavaş olabilir
     s = 0.0
     for i in range(0, max(0, k) + 1):
         s += _poisson_pmf(i, lam)
@@ -70,11 +114,11 @@ def poisson_quantile(lam: float, q: float) -> int:
     """
     Poisson(lam) için yaklaşık/yarı-kesin kantil.
     q tipik olarak {0.1, 0.5, 0.9}.
+    Küçük λ’da CDF ile arama; λ>=50'de normal yaklaşımı (hızlı).
     """
     if lam <= 0:
         return 0
     if lam >= 50 and q in _Z:
-        # normal approx
         val = lam + _Z[q] * math.sqrt(lam)
         return max(0, int(round(val)))
     # artan arama
@@ -87,7 +131,7 @@ def poisson_quantile(lam: float, q: float) -> int:
 def poisson_quantiles(lam: Iterable[float],
                       qs: Tuple[float, float, float] = (0.1, 0.5, 0.9)) -> pd.DataFrame:
     """
-    Çoklu λ için q10/q50/q90 kantilleri.
+    Çoklu λ için q10/q50/q90 kantilleri (DataFrame döner).
     """
     recs: List[dict] = []
     for L in lam:
@@ -98,9 +142,13 @@ def poisson_quantiles(lam: Iterable[float],
         recs.append({"q10": q10, "q50": q50, "q90": q90})
     return pd.DataFrame(recs)
 
+# ============================================================
+# 4) DataFrame entegrasyon yardımcıları
+# ============================================================
 def add_poisson_uncertainty(df: pd.DataFrame, lam_col: str = "pred_expected") -> pd.DataFrame:
     """
     pred_expected (λ) → {pred_q10,pred_q50,pred_q90} ve (yoksa) pred_p_occ = 1 - e^{-λ}.
+    (Küçük λ'da daha doğru olan poisson_quantiles kullanır.)
     """
     out = df.copy()
     if lam_col not in out.columns:
@@ -117,9 +165,6 @@ def add_poisson_uncertainty(df: pd.DataFrame, lam_col: str = "pred_expected") ->
     out.loc[m, "pred_p_occ"] = (1.0 - np.exp(-lam[m])).clip(0, 1)
     return out
 
-# ------------------------------------------------------------
-# Hepsini tek çağrıda eklemek için kolaylaştırıcı
-# ------------------------------------------------------------
 def add_uncertainty_and_labels(
     df: pd.DataFrame,
     thresholds: Optional[Dict[str, float]] = None,
@@ -133,7 +178,6 @@ def add_uncertainty_and_labels(
     thresholds = thresholds or {"low": 0.33, "mid": 0.66}
     out = add_poisson_uncertainty(df, lam_col=lam_col)
 
-    # risk etiketi
     if "pred_p_occ" in out.columns:
         out = out.copy()
         out["risk_level"] = [
@@ -141,16 +185,24 @@ def add_uncertainty_and_labels(
             for p in out["pred_p_occ"]
         ]
 
-    # güven etiketi
     out = add_confidence_cols(out)
     return out
 
+# ============================================================
+# 5) Dışa açılan simgeler
+# ============================================================
 __all__ = [
+    # etiketler
     "risk_level_from_prob",
     "confidence_label",
     "add_confidence_cols",
+    # olasılık ve kantiller
+    "lambda_to_p_occ",
+    "poisson_normal_quantiles",
+    "attach_poisson_quantiles",
     "poisson_quantile",
     "poisson_quantiles",
+    # DF entegrasyon
     "add_poisson_uncertainty",
     "add_uncertainty_and_labels",
 ]
