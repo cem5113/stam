@@ -31,7 +31,7 @@ def _normalize_payload(payload: dict) -> dict:
     if missing:
         raise ValueError(f"Eksik alan(lar): {', '.join(missing)}")
 
-    p = dict(payload)  # kopya
+    p = dict(payload or {})  # kopya
     # teams: listeleştir
     t = p.get("teams", [])
     if isinstance(t, (str, bytes)):
@@ -52,7 +52,6 @@ def _append_jsonl(path: Path, record: dict) -> None:
     """Tek satırlık JSONL yaz; dizini oluştur."""
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=False)
-    # Tek write çağrısı yaparak (append) atomik davranışa yaklaşırız.
     with path.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -80,7 +79,7 @@ def save_approval(payload: dict) -> str:
     return event_id
 
 
-def list_approvals(limit: int = 20) -> List[dict]:
+def list_approvals(limit: int = 500) -> List[dict]:
     """Son 'limit' kaydı döndürür (yeni → eski)."""
     if not LOG_PATH.exists():
         return []
@@ -91,7 +90,7 @@ def list_approvals(limit: int = 20) -> List[dict]:
                 rows.append(json.loads(line))
             except Exception:
                 pass
-    return rows[-limit:]
+    return rows[-int(limit):]
 
 
 def get_approval(event_id: str) -> Optional[dict]:
@@ -116,7 +115,6 @@ def verify_integrity(record: dict) -> bool:
     """
     if not isinstance(record, dict) or "hash" not in record:
         return False
-    # Hash hesaplamasına sadece payload kısmını dahil etmeliyiz:
     payload_keys = set(REQUIRED_FIELDS)
     payload = {k: record.get(k) for k in payload_keys}
     try:
