@@ -55,14 +55,17 @@ with st.sidebar:
     else:
         st.warning("GH_TOKEN yok • Release/RAW fall-back kullanılacak.")
 
-# ---- secrets → env (varsa) ----
 try:
+    import os, streamlit as st
     if "GH_TOKEN" in st.secrets:
         os.environ.setdefault("GH_TOKEN", st.secrets["GH_TOKEN"])
-    if "GITHUB_REPO" in st.secrets:
-        os.environ.setdefault("GITHUB_REPO", st.secrets["GITHUB_REPO"])
-    if "GITHUB_WORKFLOW" in st.secrets:
-        os.environ.setdefault("GITHUB_WORKFLOW", st.secrets["GITHUB_WORKFLOW"])
+        os.environ.setdefault("GITHUB_REPO", st.secrets.get("GITHUB_REPO", "cem5113/crime_prediction_data"))
+        os.environ.setdefault("GITHUB_WORKFLOW", st.secrets.get("GITHUB_WORKFLOW", "full_pipeline.yml"))
+
+    # NEW: Uygulama başlığı ve varsayılan rol de secrets'ten gelebilsin
+    for k in ("APP_NAME", "APP_ROLE"):
+        if k in st.secrets:
+            os.environ.setdefault(k, str(st.secrets[k]))
 except Exception:
     pass
 
