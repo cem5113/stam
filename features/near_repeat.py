@@ -8,6 +8,7 @@ from typing import Optional, Literal
 # Yardımcılar
 # ------------------------------------------------------------
 def _ensure_date(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
+    """date kolonunu güvenle datetime'a çevir ve NaN tarihleri düş."""
     if date_col not in df.columns:
         return df.iloc[0:0].copy()
     d = df.copy()
@@ -29,7 +30,8 @@ def _pick_value_col(df: pd.DataFrame) -> str:
     return num_cols[0] if num_cols else df.columns[0]
 
 def _is_probability(col_name: str) -> bool:
-    return col_name.lower().startswith("pred_p_") or col_name.lower().endswith("_prob") or col_name == "pred_p_occ"
+    name = col_name.lower()
+    return name.startswith("pred_p_") or name.endswith("_prob") or name == "pred_p_occ"
 
 # ------------------------------------------------------------
 # Geçici (temporal) hotspot
@@ -46,8 +48,11 @@ def compute_temp_hotspot(
 ) -> pd.DataFrame:
     """
     Son 'window_days' penceresindeki yoğunluğu, önceki 'baseline_days' tabanına göre anomali skoru üretir.
+
     Dönen kolonlar:
-      GEOID, temp_score, temp_score_norm, recent, expected, baseline_mean, base_days, method, flag_low_baseline, flag_fallback
+      GEOID, temp_score, temp_score_norm, recent, expected, baseline_mean, base_days,
+      method, flag_low_baseline, flag_fallback
+
     Notlar:
       - value_col = pred_expected / pred_p_occ / crime_count (otomatik seçilir)
       - Olasılık kolonlarında günlük toplama 'mean', sayımlarda 'sum' yapılır.
@@ -58,6 +63,7 @@ def compute_temp_hotspot(
     if d.empty or geoid_col not in d.columns:
         return pd.DataFrame(columns=[geoid_col, "temp_score"])
 
+    d = d.copy()
     d[geoid_col] = d[geoid_col].astype(str)
     value_col = value_col or _pick_value_col(d)
     is_prob = _is_probability(value_col)
@@ -97,14 +103,12 @@ def compute_temp_hotspot(
     # expected = baseline_mean * window_days (prob için: mean * window_days kabulü)
     expected = out["baseline_mean"] * float(window_days)
 
-    # Çok düşük/eksik baseline için fallback uygula
     fb_mask = low_base_mask | (out["baseline_mean"] <= 0)
     if city_base_mean > 0:
         expected = np.where(fb_mask, city_base_mean * float(window_days), expected)
         out.loc[fb_mask, "flag_fallback"] = True
     else:
-        # veri yoksa en azından bölüştürülemeyecek durumları sıfırla
-        expected = np.where(fb_mask, 1.0, expected)
+        expected = np.where(fb_mask, 1.0, expected)  # son çare: sıfıra bölmeyi önle
 
     # Skor
     if method == "zscore":
@@ -141,8 +145,10 @@ def compute_stable_hotspot(
 ) -> pd.DataFrame:
     """
     Son 'horizon_days' penceresinde istikrarlı yoğunluk skoru üretir.
+
     Dönen kolonlar:
       GEOID, stable_score, stable_score_norm, agg_value
+
     Not:
       - Olasılık kolonlarında günlük 'mean', sayımlarda 'sum' toplanır.
       - Skor z-benzeri; 0..1 normalize alanı UI için hazır.
@@ -151,6 +157,7 @@ def compute_stable_hotspot(
     if d.empty or geoid_col not in d.columns:
         return pd.DataFrame(columns=[geoid_col, "stable_score"])
 
+    d = d.copy()
     d[geoid_col] = d[geoid_col].astype(str)
     value_col = value_col or _pick_value_col(d)
     is_prob = _is_probability(value_col)
