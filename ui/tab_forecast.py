@@ -4,19 +4,22 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from typing import Tuple, Optional, List
-from models.xai import attach_xai
 
 from config.settings import RISK_THRESHOLDS
 from dataio.loaders import load_sf_crime_latest
 from services.tz import now_sf_str
 
-# Opsiyonel XAI (varsa kullan)
+# Tahmin kolonlarını eksiksizleştir
+from models.predictor import ensure_predictions
+
+# XAI (opsiyonel)
 try:
-    from models.xai import brief_xai_for_row
+    from models.xai import attach_xai, brief_xai_for_row  # type: ignore
 except Exception:
+    attach_xai = None
     brief_xai_for_row = None
 
-# (Varsa) geçici/kalıcı hotspot fonksiyonlarını kullan; yoksa sessizce atla
+# (Varsa) geçici/kalıcı hotspot fonksiyonları; yoksa sessizce atla
 try:
     from features.near_repeat import compute_temp_hotspot, compute_stable_hotspot
 except Exception:
@@ -62,9 +65,6 @@ def _ensure_time_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _fallback_proxy_risk(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tahmin kolonları yoksa: son 7 güne göre GEOID bazlı normalize (0..1) 'p_proxy'.
-    """
     dff = _ensure_time_cols(df)
     if "date" not in dff.columns:
         dff["p_proxy"] = 0.0
@@ -87,26 +87,18 @@ def _fallback_proxy_risk(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _pick_score_col(df: pd.DataFrame) -> str:
-    # Öncelik: pred_p_occ (olasılık) > pred_expected (normalize edilip 0..1) > p_proxy > crime_count
     if "pred_p_occ" in df.columns:      return "pred_p_occ"
     if "pred_expected" in df.columns:   return "pred_expected"
     if "p_proxy" in df.columns:         return "p_proxy"
     if "crime_count" in df.columns:     return "crime_count"
-    # fallback: ilk sayısal kolon
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     return num_cols[0] if num_cols else df.columns[0]
 
 def _summarize_window_geoid(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
-    """
-    Zaman penceresine indirgenmiş df'yi GEOID bazında tek skora çevirir:
-    - Olasılık ('pred_p_occ' / 'p_proxy'): mean
-    - Beklenen sayı ('pred_expected') veya sayım: sum
-    """
-    dfx = df.copy()
     if score_col in ("pred_p_occ", "p_proxy"):
-        g = dfx.groupby("GEOID", as_index=False)[score_col].mean()
+        g = df.groupby("GEOID", as_index=False)[score_col].mean()
     else:
-        g = dfx.groupby("GEOID", as_index=False)[score_col].sum()
+        g = df.groupby("GEOID", as_index=False)[score_col].sum()
     return g
 
 def _normalize_0_1(s: pd.Series) -> pd.Series:
@@ -116,19 +108,15 @@ def _normalize_0_1(s: pd.Series) -> pd.Series:
 def _prepare_topk(geo_scores: pd.DataFrame, score_col: str, k: int = 10,
                   q10: Optional[pd.Series] = None, q90: Optional[pd.Series] = None) -> pd.DataFrame:
     out = geo_scores.copy()
-    # risk seviyesi: olasılık kolonları için doğrudan, diğerlerinde normalize ederek
     if score_col in ("pred_p_occ", "p_proxy"):
         out["risk_level"] = out[score_col].map(_risk_level_from_p)
     else:
         out["risk_norm"] = _normalize_0_1(out[score_col])
         out["risk_level"] = out["risk_norm"].map(_risk_level_from_p)
-
-    # güven etiketi (varsa)
     if q10 is not None and q90 is not None and len(q10) == len(out) == len(q90):
         out["güven"] = [_confidence_label(a, b) for a, b in zip(q10.values, q90.values)]
     else:
         out["güven"] = "—"
-
     cols = ["GEOID", score_col, "risk_level", "güven"]
     keep = [c for c in cols if c in out.columns]
     return out[keep].sort_values(score_col, ascending=False).head(k)
@@ -146,11 +134,21 @@ def render():
         st.exception(e)
         return
 
-    # Tahmin kolonları yoksa proxy oluştur
+    # Tahmin kolonlarını garanti altına al (yoksa baseline ile üret)
+    df_raw = ensure_predictions(df_raw)
+
+    # Tahmin kolonları yine de yoksa (uç durum), proxy
     if not any(c in df_raw.columns for c in ("pred_p_occ", "pred_expected", "pred_q50")):
         df_raw = _fallback_proxy_risk(df_raw)
-    df_x = attach_xai(df_raw, topk=3) 
-    
+
+    # Opsiyonel XAI -> xai_reasons kolonu
+    df_x = None
+    if attach_xai is not None:
+        try:
+            df_x = attach_xai(df_raw, topk=3)  # type: ignore
+        except Exception:
+            df_x = None
+
     # Sol panel (filtreler)
     left, mid, right = st.columns([1.1, 2.2, 1.2])
     with left:
@@ -198,15 +196,12 @@ def render():
 
     # Seçilen pencereye göre veri altkümesi
     if win.startswith("0–24"):
-        # seçilen gün (00:00–23:59)
         if "date" in df.columns:
             mask = df["date"].dt.date == pd.to_datetime(d_pick).date()
             df_win = df[mask].copy()
         else:
             df_win = df.copy()
-
     elif win.startswith("72"):
-        # referans günün sonuna kadar 72 saat geriye
         end = pd.to_datetime(d_pick) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
         start = end - pd.Timedelta(hours=72)
         if "date" in df.columns:
@@ -214,9 +209,7 @@ def render():
             df_win = df[mask].copy()
         else:
             df_win = df.copy()
-
     else:
-        # 1 hafta (günlük)
         end = pd.to_datetime(d_pick)
         start = end - pd.Timedelta(days=6)
         if "date" in df.columns:
@@ -231,10 +224,8 @@ def render():
     # Top-K tablo (güven etiketini varsa kullan)
     q10 = q90 = None
     if {"pred_q10", "pred_q90"}.issubset(df_win.columns):
-        # GEOID bazında q10/q90 için mean alın (hızlı özet)
         q10 = df_win.groupby("GEOID")["pred_q10"].mean()
         q90 = df_win.groupby("GEOID")["pred_q90"].mean()
-        # align
         geo_scores = geo_scores.merge(q10.rename("q10"), on="GEOID", how="left")
         geo_scores = geo_scores.merge(q90.rename("q90"), on="GEOID", how="left")
         topk = _prepare_topk(geo_scores, score_col=score_col, k=int(k_top),
@@ -247,20 +238,17 @@ def render():
         st.markdown("**Tahmin Haritası**")
         lat_col, lon_col = _latlon_columns(df_raw)
         if lat_col and lon_col and "GEOID" in df_raw.columns:
-            # GEOID → tekil koordinat (ortalama)
             centroids = (
                 df_raw.groupby("GEOID", as_index=False)[[lat_col, lon_col]]
                 .mean(numeric_only=True)
                 .dropna()
             )
             view = centroids.merge(geo_scores, on="GEOID", how="left")
-            # 0..1 seviye (olasılık ise direkt kullan, değilse normalize)
             if score_col in ("pred_p_occ", "p_proxy"):
                 view["level"] = view[score_col].clip(0, 1)
             else:
                 view["level"] = _normalize_0_1(view[score_col])
 
-            # Hotspot katmanları (opsiyonel, mevcutsa)
             layers = []
             tooltip = {
                 "html": "<b>GEOID:</b> {GEOID}<br/>"
@@ -297,7 +285,7 @@ def render():
                                 "get_fill_color": "[255,140,0]"
                             })
                 except Exception:
-                    st.caption("Geçici hotspot hesaplanamadı (near_repeat modülü).")
+                    st.caption("Geçici hotspot hesaplanamadı (near_repeat).")
 
             # Kalıcı hotspot
             if layer_stable and compute_stable_hotspot is not None:
@@ -316,7 +304,7 @@ def render():
                                 "get_fill_color": "[0,128,255]"
                             })
                 except Exception:
-                    st.caption("Kalıcı hotspot hesaplanamadı (near_repeat modülü).")
+                    st.caption("Kalıcı hotspot hesaplanamadı (near_repeat).")
 
             if layers:
                 st.pydeck_chart({
@@ -379,16 +367,19 @@ def render():
                     st.metric("Son 7 gün", int(s7))
                     st.metric("Son 30 gün", int(s30))
 
-            # İlk 3 etken (XAI)
+            # İlk 3 etken (XAI) — varsa
             if brief_xai_for_row is not None and len(sub) > 0:
                 row = sub.sort_values("date", ascending=False).iloc[0].to_dict() if "date" in sub.columns else sub.iloc[0].to_dict()
-                facts = brief_xai_for_row(row)
+                try:
+                    facts = brief_xai_for_row(row)  # type: ignore
+                except Exception:
+                    facts = None
                 if facts:
                     st.markdown("**İlk 3 etken (XAI)**")
                     for f in facts:
                         st.markdown(f"- **{f['name']}** — {f['why']}")
 
-            if "xai_reasons" in df_x.columns:
+            if df_x is not None and "xai_reasons" in df_x.columns:
                 r = df_x[df_x["GEOID"].astype(str) == str(pick)]
                 if len(r) > 0 and isinstance(r.iloc[0]["xai_reasons"], str) and r.iloc[0]["xai_reasons"]:
                     st.markdown("**İlk 3 etken (XAI)**")
