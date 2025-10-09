@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from typing import Tuple, Optional, List
+from models.xai import attach_xai
 
 from config.settings import RISK_THRESHOLDS
 from dataio.loaders import load_sf_crime_latest
@@ -148,7 +149,8 @@ def render():
     # Tahmin kolonları yoksa proxy oluştur
     if not any(c in df_raw.columns for c in ("pred_p_occ", "pred_expected", "pred_q50")):
         df_raw = _fallback_proxy_risk(df_raw)
-
+    df_x = attach_xai(df_raw, topk=3) 
+    
     # Sol panel (filtreler)
     left, mid, right = st.columns([1.1, 2.2, 1.2])
     with left:
@@ -385,6 +387,12 @@ def render():
                     st.markdown("**İlk 3 etken (XAI)**")
                     for f in facts:
                         st.markdown(f"- **{f['name']}** — {f['why']}")
+
+            if "xai_reasons" in df_x.columns:
+                r = df_x[df_x["GEOID"].astype(str) == str(pick)]
+                if len(r) > 0 and isinstance(r.iloc[0]["xai_reasons"], str) and r.iloc[0]["xai_reasons"]:
+                    st.markdown("**İlk 3 etken (XAI)**")
+                    st.markdown(r.iloc[0]["xai_reasons"])
 
             # Kısa trend
             if "date" in sub.columns:
