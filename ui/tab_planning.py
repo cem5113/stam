@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 from datetime import timedelta
 from typing import List, Dict, Tuple, Optional
+from services.auth import can_approve
 
 from dataio.loaders import load_sf_crime_latest
 from features.stats_classic import spatial_top_geoid
@@ -249,9 +250,14 @@ def render():
                 start = st.text_input("Başlangıç (SF)", value=t0.isoformat(timespec="minutes"))
                 end   = st.text_input("Bitiş (SF)", value=t1.isoformat(timespec="minutes"))
                 approver = st.text_input("Onaylayan", value="amir.soyad")
-
-                submitted = st.form_submit_button("✅ Onayı Kaydet")
-                if submitted:
+    
+                # 👇 YETKİ KONTROLÜ — butonu devre dışı bırak
+                is_allowed = can_approve()
+                submitted = st.form_submit_button("✅ Onayı Kaydet", disabled=not is_allowed)
+                if not is_allowed:
+                    st.info("Bu işlem için **Amir** rolü gerekir. Sidebar’dan rolü değiştirerek deneyebilirsiniz.")
+    
+                if submitted and is_allowed:
                     payload = {
                         "alt_id": sel["alt_id"],
                         "assignment": dev_code,
@@ -259,15 +265,10 @@ def render():
                         "start": start,
                         "end": end,
                         "approver": approver,
-                        # bilgi amaçlı ekler:
+                        # bilgi amaçlı:
                         "route_geoids": sel["cells"],
                         "coverage": f"{sel['coverage']:.4f}",
                         "diversity": f"{sel['diversity']:.4f}",
                     }
                     eid = save_approval(payload)
                     st.success(f"Onay kaydedildi • Kayıt ID: `{eid}`")
-
-        st.markdown("---")
-        st.caption("**Son Onaylar**")
-        for r in list_approvals(limit=8):
-            st.caption(f"• {r.get('ts_sf','-')} | ID:{r.get('event_id','-')} | {r.get('assignment','-')} | {r.get('alt_id','-')}")
