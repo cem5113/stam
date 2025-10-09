@@ -4,9 +4,15 @@ from typing import Dict, Tuple, Optional, List, Iterable
 import numpy as np
 import pandas as pd
 
-# ÖNCEKİ: from models.uncertainty import poisson_quantiles, prob_at_least_one
-# DÜZELTME: paket içi bağıl import
-from .uncertainty import poisson_quantiles, prob_at_least_one
+# --- SAĞLAM IMPORT: Önce bağıl, sonra mutlak, en son yerel ---
+try:
+    from .uncertainty import poisson_quantiles, prob_at_least_one  # paket içi (tercih)
+except Exception:
+    try:
+        from models.uncertainty import poisson_quantiles, prob_at_least_one  # mutlak
+    except Exception:
+        # Paket bağlamı yoksa (ör. tek script gibi çalıştırıldıysa) son çare:
+        from uncertainty import poisson_quantiles, prob_at_least_one  # type: ignore
 
 # ---------------------------------------------------------------------
 # Yardımcılar
@@ -37,6 +43,7 @@ def _ensure_time(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+
 def _y_col(df: pd.DataFrame) -> str:
     """
     Sayım temelli hedef kolon; bulunamazsa her satırı 1 sayar.
@@ -48,8 +55,10 @@ def _y_col(df: pd.DataFrame) -> str:
     df["_ones"] = 1
     return "_ones"
 
+
 # Eski adla geriye dönük uyumluluk
 _ycol = _y_col
+
 
 def _pick_y(df: pd.DataFrame) -> str:
     """
@@ -64,6 +73,7 @@ def _pick_y(df: pd.DataFrame) -> str:
             return c
     nums = df.select_dtypes(include=[np.number]).columns.tolist()
     return nums[0] if nums else df.columns[0]
+
 
 # ---------------------------------------------------------------------
 # 0) Kolay kullanım: Poisson tabanlı baseline (UI ile tam uyumlu)
@@ -88,17 +98,26 @@ def baseline_expected(df_raw: pd.DataFrame, lookback_days: int = 30) -> pd.DataF
         hist = df.copy()
 
     # GEOID×hour ortalamaları
-    geo_hour = (hist.groupby(["GEOID", "event_hour"], as_index=False)[ycol]
-                    .mean().rename(columns={ycol: "mu_geo_hour"}))
+    geo_hour = (
+        hist.groupby(["GEOID", "event_hour"], as_index=False)[ycol]
+        .mean()
+        .rename(columns={ycol: "mu_geo_hour"})
+    )
     # GEOID ortalamaları
-    geo_mu = (hist.groupby("GEOID", as_index=False)[ycol]
-                 .mean().rename(columns={ycol: "mu_geo"}))
+    geo_mu = (
+        hist.groupby("GEOID", as_index=False)[ycol]
+        .mean()
+        .rename(columns={ycol: "mu_geo"})
+    )
     # şehir ortalaması
     g_city = float(pd.to_numeric(hist[ycol], errors="coerce").fillna(0).mean())
 
     # saat etkisi (varsa)
-    by_hour = (hist.groupby("event_hour", as_index=False)[ycol]
-                  .mean().rename(columns={ycol: "mu_hour"}))
+    by_hour = (
+        hist.groupby("event_hour", as_index=False)[ycol]
+        .mean()
+        .rename(columns={ycol: "mu_hour"})
+    )
     hour_map = by_hour.set_index("event_hour")["mu_hour"].to_dict() if len(by_hour) else {}
 
     out = df.copy()
@@ -107,11 +126,13 @@ def baseline_expected(df_raw: pd.DataFrame, lookback_days: int = 30) -> pd.DataF
 
     # hiyerarşik fallback
     out["pred_expected"] = np.where(
-        out["mu_geo_hour"].notna(), out["mu_geo_hour"],
+        out["mu_geo_hour"].notna(),
+        out["mu_geo_hour"],
         np.where(
-            out["mu_geo"].notna(), out["mu_geo"],
-            pd.Series([hour_map.get(int(h), g_city) for h in out["event_hour"]], index=out.index)
-        )
+            out["mu_geo"].notna(),
+            out["mu_geo"],
+            pd.Series([hour_map.get(int(h), g_city) for h in out["event_hour"]], index=out.index),
+        ),
     ).astype(float)
 
     # Olasılık & Poisson kuantilleri
@@ -124,6 +145,7 @@ def baseline_expected(df_raw: pd.DataFrame, lookback_days: int = 30) -> pd.DataF
     # temizlik
     out.drop(columns=["mu_geo_hour", "mu_geo"], inplace=True, errors="ignore")
     return out
+
 
 # ---------------------------------------------------------------------
 # 1) Frekans-temelli baseline (λ haftalık oran)
@@ -193,6 +215,7 @@ def fit_frequency_baseline(
         "horizon_days": int(horizon_days),
     }
 
+
 def predict_expected_baseline(
     df_raw: pd.DataFrame,
     model: Dict,
@@ -213,14 +236,15 @@ def predict_expected_baseline(
 
     def one_row(i) -> float:
         geoid = str(df.at[i, "GEOID"]) if "GEOID" in df.columns else None
-        dow   = int(df.at[i, "day_of_week"]) if "day_of_week" in df.columns else None
-        hour  = int(df.at[i, "event_hour"]) if "event_hour" in df.columns else None
+        dow = int(df.at[i, "day_of_week"]) if "day_of_week" in df.columns else None
+        hour = int(df.at[i, "event_hour"]) if "event_hour" in df.columns else None
         lam_week = float(r3.get((geoid, dow, hour)) or r2.get((geoid, dow)) or r1.get(geoid) or r0)
         if scale == "weekly":
             return lam_week
         return lam_week / float(slots_per_week or 168)
 
     return pd.Series({i: one_row(i) for i in df.index}, index=df.index, dtype=float).rename("pred_expected")
+
 
 # ---------------------------------------------------------------------
 # 2) Pencere-temelli baseline (p_proxy; 0..1)
@@ -257,17 +281,22 @@ class BaselineModel:
             self.table_geo_hour = pd.DataFrame(columns=["GEOID", "event_hour", "hour_weight"])
             return self
 
-    # ...
-        g = (dsub.groupby("GEOID", as_index=False)[y].sum()
-                 .rename(columns={y: "recent_sum"}))
+        g = (
+            dsub.groupby("GEOID", as_index=False)[y]
+            .sum()
+            .rename(columns={y: "recent_sum"})
+        )
         mx = float(g["recent_sum"].max() or 1.0)
         g["p_proxy"] = (g["recent_sum"] / (mx if mx > 0 else 1.0)).clip(0, 1)
         self.table_geo = g[["GEOID", "p_proxy"]].copy()
 
         # Saat etkisi (opsiyonel)
         if self.use_hour and "event_hour" in dsub.columns:
-            gh = (dsub.groupby(["GEOID", "event_hour"], as_index=False)[y].mean()
-                    .rename(columns={y: "hour_mean"}))
+            gh = (
+                dsub.groupby(["GEOID", "event_hour"], as_index=False)[y]
+                .mean()
+                .rename(columns={y: "hour_mean"})
+            )
             # GEOID içinde normalize
             gh["hour_weight"] = gh.groupby("GEOID")["hour_mean"].transform(
                 lambda s: (s / (s.max() if s.max() > 0 else 1.0)).clip(0, 1)
@@ -299,6 +328,7 @@ class BaselineModel:
 
         return out
 
+
 # ---------------------------------------------------------------------
 # 3) Grup-ortalaması baseline (GEOID × event_hour vb.)
 # ---------------------------------------------------------------------
@@ -321,13 +351,10 @@ def fit_mean_by_groups(
         mu = float(np.nanmean(dfx[y_col])) if len(dfx) else 0.0
         return {"y_col": y_col, "groups": [], "table": pd.DataFrame(), "global_mean": mu}
 
-    table = (
-        dfx.groupby(group_cols, as_index=False)[y_col]
-           .mean()
-           .rename(columns={y_col: "mean"})
-    )
+    table = dfx.groupby(group_cols, as_index=False)[y_col].mean().rename(columns={y_col: "mean"})
     glob = float(np.nanmean(dfx[y_col])) if len(dfx) else 0.0
     return {"y_col": y_col, "groups": group_cols, "table": table, "global_mean": glob}
+
 
 def predict_mean_by_groups(model: Dict, df_new: pd.DataFrame) -> pd.Series:
     """
