@@ -1,18 +1,23 @@
-# models/baseline.py
+# sutam/models/baseline.py
 from __future__ import annotations
 from typing import Dict, Tuple, Optional, List, Iterable
 import numpy as np
 import pandas as pd
 
-# --- SAĞLAM IMPORT: Önce bağıl, sonra mutlak, en son yerel ---
+# --- Paket içi import (önerilen) ---
 try:
-    from .uncertainty import poisson_quantiles, prob_at_least_one  # paket içi (tercih)
-except Exception:
+    from .uncertainty import poisson_quantiles, prob_at_least_one
+except ImportError as e:
+    # Paket içi import başarısızsa (örn. streamlit çalışma yolu sapması)
     try:
-        from models.uncertainty import poisson_quantiles, prob_at_least_one  # mutlak
-    except Exception:
-        # Paket bağlamı yoksa (ör. tek script gibi çalıştırıldıysa) son çare:
-        from .uncertainty import poisson_quantiles, prob_at_least_one
+        from sutam.models.uncertainty import poisson_quantiles, prob_at_least_one
+    except ImportError:
+        raise ImportError(
+            "uncertainty modülü bulunamadı. Şunları kontrol edin:\n"
+            "1) sutam/models/uncertainty.py mevcut mu?\n"
+            "2) sutam/ ve sutam/models/ içinde __init__.py var mı?\n"
+            "3) Uygulamayı proje kökünden çalıştırıyor musunuz? (cd /mount/src; streamlit run sutam/app.py)"
+        ) from e
 
 # ---------------------------------------------------------------------
 # Yardımcılar
