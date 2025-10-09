@@ -84,7 +84,7 @@ def _recent_geoid_penalty(recent_routes: List[List[str]], bias: float) -> Dict[s
         recent_set.update(map(str, r))
     pen = {}
     for gid in recent_set:
-        pen[str(gid)] = max(0.0, 1.0 - bias)  # örn. bias=0.4 → 0.6 katsayı
+        pen[str(gid)] = max(0.0, 1.0 - bias)
     return pen
 
 def _apply_penalty(geo_scores: pd.DataFrame, penalty: Dict[str, float]) -> pd.DataFrame:
@@ -227,7 +227,6 @@ def render():
     with mid:
         st.markdown("**Önerilen Rotalar**")
         if gen or ("route_alts" not in st.session_state) or (seed_geoids is not None):
-            
             recent_routes = [r.get("route_geoids") or r.get("cells") or [] for r in list_approvals(limit=30)]
             st.session_state["route_alts"] = _propose_routes(
                 df=dfw,
