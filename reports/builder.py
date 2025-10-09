@@ -56,7 +56,7 @@ def _list_to_csv(val) -> str:
     return str(val)
 
 # -------------------------------------------------------------------
-# ZIP / CSV paketleyiciler (ilk bloktan)
+# ZIP / CSV paketleyiciler
 # -------------------------------------------------------------------
 def pack_zip(files: Dict[str, bytes]) -> bytes:
     """{dosya_adı: bytes} -> tek zip bytes"""
@@ -113,7 +113,7 @@ def planned_patrols_table(limit: int = 200) -> pd.DataFrame:
     return approvals_to_df(rows)
 
 # -------------------------------------------------------------------
-# Günlük/haftalık temel tablolar (ikinci bloktan)
+# Günlük/haftalık temel tablolar
 # -------------------------------------------------------------------
 def daily_tables(df: pd.DataFrame,
                  d1: pd.Timestamp, d2: pd.Timestamp,
@@ -153,7 +153,7 @@ def daily_tables(df: pd.DataFrame,
     return {"top_geoid": top_geoid, "offense": off, "by_hour": by_hour, "subset": sub}
 
 # -------------------------------------------------------------------
-# Heuristik öneriler (ikinci bloktan)
+# Heuristik öneriler
 # -------------------------------------------------------------------
 def heuristic_suggestions(df_sub: pd.DataFrame,
                           top_geoid: pd.DataFrame,
@@ -216,7 +216,7 @@ def heuristic_suggestions(df_sub: pd.DataFrame,
     return msgs
 
 # -------------------------------------------------------------------
-# Rapor dışa aktarımı (ikinci bloktan) + ZIP opsiyonu
+# Rapor dışa aktarımı + ZIP
 # -------------------------------------------------------------------
 def export_report(prefix: str,
                   tables: Dict[str, pd.DataFrame],
@@ -247,8 +247,7 @@ def export_report(prefix: str,
     if "top_geoid" in tables and isinstance(tables["top_geoid"], pd.DataFrame) and not tables["top_geoid"].empty:
         best = tables["top_geoid"].iloc[0]
         vcol = _pick_value_col(tables["top_geoid"])
-        md.append(f"- En yüksek risk: GEOID {best.get('GEOID', '-')}"
-                  f" (skor={best.get(vcol, 0)})")
+        md.append(f"- En yüksek risk: GEOID {best.get('GEOID', '-')} (skor={best.get(vcol, 0)})")
 
     if suggestions:
         md.append("\n## Öneriler (olasılıklı)")
