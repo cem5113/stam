@@ -1,14 +1,8 @@
-# --- UI ---
-streamlit>=1.32,<1.39
-
-# --- Data & numerics ---
-pandas>=2.2,<2.3
-numpy>=1.26,<2.2
 fastparquet==2024.5.0
-
-# --- Timezones ---
 tzdata>=2024.1
 pytz>=2024.1
-
-# --- HTTP (opsiyonel) ---
 requests>=2.31,<3
+streamlit>=1.39
+matplotlib>=3.9
+numpy>=1.26
+pandas>=2.1
