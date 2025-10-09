@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 
 # --- Sağlam import başlığı: proje kökünü sys.path'e ekle ---
-# /mount/src/sutam/app.py  -> proje_kökü: /mount/src
 _THIS_FILE = Path(__file__).resolve()
 _PACKAGE_DIR = _THIS_FILE.parent                 # .../sutam
 _PROJECT_ROOT = _PACKAGE_DIR.parent              # .../
@@ -15,11 +14,13 @@ if str(_PROJECT_ROOT) not in sys.path:
 # ----------------------------------------------------------------
 # Buradan sonrası: her şeyi "mutlak paket" importlarıyla yap
 import os
+import pandas as pd
 import streamlit as st
 
 # ---- Paket-içi importlar (mutlak) ----
 from sutam.config.settings import APP_NAME
 from sutam.dataio.loaders import load_metadata
+from sutam.dataio.bootstrap import get_bootstrap  # ✅ yeni eklendi
 
 # UI sekmeleri
 from sutam.ui.home import render as render_home
@@ -32,24 +33,6 @@ from sutam.ui.tab_reports import render as render_reports
 from sutam.services.auth import role_selector_in_sidebar
 from sutam.services.logging import audit
 
-# --- Yeni eklenen bootstrap & refresh ---
-from sutam.dataio.bootstrap import get_bootstrap
-
-with st.sidebar:
-    if st.button("🔄 Veriyi Yenile"):
-        st.cache_data.clear()
-        st.rerun()
-
-meta, df = get_bootstrap()
-
-app_name = meta.get("app_name") or APP_NAME
-st.title(app_name)
-
-if df is None or df.empty:
-    st.error("Veri yüklenemedi veya boş görünüyor. Veri kaynak/ENV ayarlarını kontrol edin.")
-else:
-    st.success(f"Veri yüklendi: {len(df):,} satır")
-
 # ---- Sayfa ayarı ----
 st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
 
@@ -60,14 +43,14 @@ with st.sidebar:
 
     # küçük meta özeti (artifact/release metadata.json varsa)
     try:
-        meta = load_metadata() or {}
-        if meta:
+        meta_info = load_metadata() or {}
+        if meta_info:
             st.caption("Veri/Model meta (özet)")
             st.json(
                 {
-                    k: meta[k]
+                    k: meta_info[k]
                     for k in ("model_version", "last_trained_at", "last_data_refresh_at")
-                    if k in meta
+                    if k in meta_info
                 }
             )
     except Exception:
@@ -81,7 +64,14 @@ with st.sidebar:
         except Exception as e:
             st.warning(f"Cache temizlenemedi: {e}")
 
-    # GitHub token bilgisi (artifact-öncelikli akış için)
+    if st.button("🔄 Veriyi Yenile", use_container_width=True):
+        try:
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Yenileme başarısız: {e}")
+
+    # GitHub token bilgisi
     gh_tok = st.secrets.get("GH_TOKEN", os.environ.get("GH_TOKEN", ""))
     if gh_tok:
         st.info("GH_TOKEN bulundu • Artifact-öncelikli veri çekimi aktif.")
@@ -95,12 +85,22 @@ try:
         os.environ.setdefault("GITHUB_REPO", st.secrets.get("GITHUB_REPO", "cem5113/crime_prediction_data"))
         os.environ.setdefault("GITHUB_WORKFLOW", st.secrets.get("GITHUB_WORKFLOW", "full_pipeline.yml"))
 
-    # Başlık ve varsayılan rol de secrets'ten gelebilsin
     for k in ("APP_NAME", "APP_ROLE"):
         if k in st.secrets:
             os.environ.setdefault(k, str(st.secrets[k]))
 except Exception:
     pass
+
+# ---- Açılışta otomatik veri yükleme (cache sayesinde hızlı) ----
+meta, df = get_bootstrap()
+
+app_name = meta.get("app_name") or APP_NAME
+st.title(app_name)
+
+if not isinstance(df, pd.DataFrame) or df.empty:
+    st.error("Veri yüklenemedi veya boş görünüyor. Veri kaynak/ENV ayarlarını kontrol edin.")
+else:
+    st.success(f"Veri yüklendi: {len(df):,} satır")
 
 # ---- İlk açılış audit ----
 audit(event="app_open", actor=role, payload={"tab": "Home"})
