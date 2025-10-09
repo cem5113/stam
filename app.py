@@ -1,9 +1,23 @@
 # sutam/app.py
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+# --- Sağlam import başlığı: proje kökünü sys.path'e ekle ---
+# /mount/src/sutam/app.py  -> proje_kökü: /mount/src
+_THIS_FILE = Path(__file__).resolve()
+_PACKAGE_DIR = _THIS_FILE.parent                 # .../sutam
+_PROJECT_ROOT = _PACKAGE_DIR.parent              # .../
+
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# ----------------------------------------------------------------
+# Buradan sonrası: her şeyi "mutlak paket" importlarıyla yap
 import os
 import streamlit as st
 
-# ---- Paket-içi importlar (tamamı mutlak) ----
+# ---- Paket-içi importlar (mutlak) ----
 from sutam.config.settings import APP_NAME
 from sutam.dataio.loaders import load_metadata
 
