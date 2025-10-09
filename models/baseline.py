@@ -12,7 +12,7 @@ except Exception:
         from models.uncertainty import poisson_quantiles, prob_at_least_one  # mutlak
     except Exception:
         # Paket bağlamı yoksa (ör. tek script gibi çalıştırıldıysa) son çare:
-        from uncertainty import poisson_quantiles, prob_at_least_one  # type: ignore
+        from .uncertainty import poisson_quantiles, prob_at_least_one
 
 # ---------------------------------------------------------------------
 # Yardımcılar
