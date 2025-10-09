@@ -1,10 +1,6 @@
-# config/settings.py
 from __future__ import annotations
-import os, json, subprocess
+import os
 from pathlib import Path
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any
 
 # ── Uygulama adı ───────────────────────────────────────────────────────────────
 APP_NAME: str = os.getenv("APP_NAME", "SUTAM – Suç Tahmin Modeli")
@@ -21,10 +17,11 @@ DATA_DIR    = Path(os.getenv("DATA_DIR", BASE_DIR / "data")).resolve()
 RESULTS_DIR = Path(os.getenv("RESULTS_DIR", BASE_DIR / "results")).resolve()
 OUT_DIR     = Path(os.getenv("OUT_DIR", BASE_DIR / "out")).resolve()
 LOG_DIR     = Path(os.getenv("LOG_DIR", BASE_DIR / "logs")).resolve()
+
 # Uygulama çalışsın diye en azından out/logs var olsun
 for p in (OUT_DIR, LOG_DIR):
     p.mkdir(parents=True, exist_ok=True)
-
+    
 # ── Yardımcılar ───────────────────────────────────────────────────────────────
 def _git_rev_short(path: Path) -> Optional[str]:
     try:
