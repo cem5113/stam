@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 import streamlit as st
+from ui.tab_forecast import render as render_forecast
 
 st.set_page_config(page_title="SUTAM", layout="wide")
 
@@ -32,7 +33,7 @@ with tabs[1]:
     st.info("Devriye Planlama buraya gelecek (bir sonraki adımda).")
 
 with tabs[2]:
-    st.info("Suç Tahmini bileşenleri burada (harita + Top-K + popup).")
+    render_forecast()
 
 with tabs[3]:
     st.info("Suç İstatistikleri (saat/gün/ay, tür dağılımı) burada.")
