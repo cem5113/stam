@@ -4,8 +4,12 @@ import streamlit as st
 from ui.tab_forecast import render as render_forecast
 from ui.tab_stats import render as render_stats
 from ui.tab_planning import render as render_planning
+from services.auth import role_selector_in_sidebar, get_role
+from services.logging import audit
 
 st.set_page_config(page_title="SUTAM", layout="wide")
+role = role_selector_in_sidebar()
+audit(event="app_open", actor=role, payload={"tab": "Home"})
 
 # (opsiyonel) secrets → env aktarımı; yoksa atlanır
 try:
