@@ -32,6 +32,24 @@ from sutam.ui.tab_reports import render as render_reports
 from sutam.services.auth import role_selector_in_sidebar
 from sutam.services.logging import audit
 
+# --- Yeni eklenen bootstrap & refresh ---
+from sutam.dataio.bootstrap import get_bootstrap
+
+with st.sidebar:
+    if st.button("🔄 Veriyi Yenile"):
+        st.cache_data.clear()
+        st.rerun()
+
+meta, df = get_bootstrap()
+
+app_name = meta.get("app_name") or APP_NAME
+st.title(app_name)
+
+if df is None or df.empty:
+    st.error("Veri yüklenemedi veya boş görünüyor. Veri kaynak/ENV ayarlarını kontrol edin.")
+else:
+    st.success(f"Veri yüklendi: {len(df):,} satır")
+
 # ---- Sayfa ayarı ----
 st.set_page_config(page_title=APP_NAME, page_icon="🔎", layout="wide")
 
