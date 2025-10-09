@@ -102,11 +102,13 @@ def _propose_routes(
     harm_weighted: bool,
     diversity_bias: float,
     recent_routes: List[List[str]],
+    seed_geoids: Optional[List[str]] = None,   # <-- Forecast’ten gelen tohumlar
 ) -> List[Dict]:
     """
     Basit öneri:
     - Son 7 güne göre GEOID skorları (pred_expected/occ veya count).
     - Çeşitlilik için: son onaylı rotalarda kullanılan GEOID’lere ceza uygula.
+    - seed_geoids varsa, sıralamada öne al.
     """
     dfr = _recent_slice(df, days=7)
     if "GEOID" not in dfr.columns:
@@ -125,6 +127,12 @@ def _propose_routes(
 
     penalty = _recent_geoid_penalty(recent_routes, diversity_bias)
     ranked = _apply_penalty(geo_scores, penalty)["GEOID"].astype(str).tolist()
+
+    # --- seed (tohum) GEOID'leri öne al (sıra korunarak) ---
+    if seed_geoids:
+        seed = [str(g) for g in seed_geoids if str(g) in ranked]
+        rest = [g for g in ranked if g not in set(seed)]
+        ranked = seed + rest
 
     alts: List[Dict] = []
     step = max(1, route_len // 2)
@@ -207,6 +215,14 @@ def render():
     # 3) Veri kesiti
     dfw = _slice_by_range_and_cat(df, d1, d2, pick_cats, ccol)
 
+    # --- Forecast sekmesinden gelen tohum GEOID’ler (varsa) ---
+    try:
+        seed_geoids = st.session_state.pop("plan_geoids_seed", None)
+    except Exception:
+        seed_geoids = None
+    if seed_geoids:
+        st.info(f"Planlama başlangıç listesi Forecast sekmesinden alındı • {len(seed_geoids)} GEOID.")
+
     # 4) Orta panel — öneri listesi + harita
     with mid:
         st.markdown("**Önerilen Rotalar**")
@@ -220,6 +236,7 @@ def render():
                 harm_weighted=harm_weighted,
                 diversity_bias=float(diversity_bias),
                 recent_routes=recent_routes,
+                seed_geoids=seed_geoids,  # <-- tohumları sıraya öne al
             )
         alts = st.session_state.get("route_alts", [])
 
