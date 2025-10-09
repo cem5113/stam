@@ -226,7 +226,8 @@ def render():
     # 4) Orta panel — öneri listesi + harita
     with mid:
         st.markdown("**Önerilen Rotalar**")
-        if gen or "route_alts" not in st.session_state:
+        if gen or ("route_alts" not in st.session_state) or (seed_geoids is not None):
+            
             recent_routes = [r.get("route_geoids") or r.get("cells") or [] for r in list_approvals(limit=30)]
             st.session_state["route_alts"] = _propose_routes(
                 df=dfw,
