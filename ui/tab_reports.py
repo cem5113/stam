@@ -2,7 +2,7 @@
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
-from datetime import timedelta
+import numpy as np
 from typing import List, Dict, Tuple, Optional
 
 from dataio.loaders import load_sf_crime_latest
@@ -10,149 +10,221 @@ from patrol.approvals import list_approvals
 from features.stats_classic import time_distributions, spatial_top_geoid, offense_breakdown
 from reports.builder import approvals_to_df, frames_to_csv_bytes, pack_zip
 
+# (opsiyonel) geçici hotspot; yoksa sessiz atla
+try:
+    from features.near_repeat import compute_temp_hotspot
+except Exception:
+    compute_temp_hotspot = None
+
+# ---------- helpers ----------
+def _ensure_time(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "date" not in out.columns and "datetime" in out.columns:
+        out["date"] = pd.to_datetime(out["datetime"], errors="coerce").dt.date
+    out["date"] = pd.to_datetime(out.get("date", pd.NaT), errors="coerce")
+    return out.dropna(subset=["date"], errors="ignore")
+
 def _category_col(df: pd.DataFrame) -> Optional[str]:
     for c in ("category_grouped","category","subcategory_grouped","subcategory"):
         if c in df.columns: return c
     return None
 
-def _date_bounds(df: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    if "date" in df.columns:
-        dd = pd.to_datetime(df["date"], errors="coerce").dropna()
-        if len(dd) > 0:
-            return dd.min().normalize(), dd.max().normalize()
-    now = pd.Timestamp.today().normalize()
-    return now - pd.Timedelta(days=30), now
+def _period_to_range(period: str, ref: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    ref = pd.to_datetime(ref).normalize()
+    if period.startswith("Gün"):  start, end = ref, ref
+    elif period.startswith("Haft"): start, end = ref - pd.Timedelta(days=6), ref
+    else:                          start, end = ref - pd.Timedelta(days=29), ref
+    return start, end
 
-def _slice_df(df: pd.DataFrame, d1: pd.Timestamp, d2: pd.Timestamp, cats: List[str], ccol: Optional[str]) -> pd.DataFrame:
+def _slice_df(df: pd.DataFrame, d1: pd.Timestamp, d2: pd.Timestamp,
+              cats: List[str], ccol: Optional[str]) -> pd.DataFrame:
     out = df.copy()
     if "date" in out.columns:
-        out["date"] = pd.to_datetime(out["date"], errors="coerce")
         out = out[(out["date"] >= d1) & (out["date"] <= d2)]
     if ccol and cats:
         out = out[out[ccol].astype(str).isin(cats)]
     return out
 
-def _period_choice_to_range(choice: str, end_max: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    end = end_max
-    if choice == "Günlük":
-        start = end
-    elif choice == "Haftalık":
-        start = end - pd.Timedelta(days=6)
-    else:  # Aylık
-        start = end - pd.Timedelta(days=29)
-    return start.normalize(), end.normalize()
+def _pick_score_col(df: pd.DataFrame) -> str:
+    if "pred_p_occ" in df.columns:    return "pred_p_occ"     # olasılık → mean
+    if "pred_expected" in df.columns: return "pred_expected"  # beklenen → sum
+    if "crime_count" in df.columns:   return "crime_count"
+    num = df.select_dtypes(include=[np.number]).columns.tolist()
+    return num[0] if num else df.columns[0]
 
+def _geo_aggregate(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
+    if len(df) == 0 or "GEOID" not in df.columns:
+        return pd.DataFrame(columns=["GEOID", score_col, "risk_norm"])
+    if score_col == "pred_p_occ":
+        g = df.groupby("GEOID", as_index=False)[score_col].mean()
+    else:
+        g = df.groupby("GEOID", as_index=False)[score_col].sum()
+    mx = float(g[score_col].max() or 1.0)
+    g["risk_norm"] = (g[score_col] / (mx if mx > 0 else 1.0)).clip(0, 1)
+    return g
+
+def _planned_counts_by_geoid(start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, int]:
+    rows = list_approvals(limit=1000)
+    counts: Dict[str,int] = {}
+    for r in rows:
+        try:
+            ts = pd.to_datetime(r.get("ts_sf"))
+            if not (start <= ts <= end): continue
+            for c in r.get("cells", []):
+                key = str(c)
+                counts[key] = counts.get(key, 0) + 1
+        except Exception:
+            continue
+    return counts
+
+def _temp_hotspot_map(df_win: pd.DataFrame) -> Dict[str, float]:
+    if compute_temp_hotspot is None or len(df_win) == 0:
+        return {}
+    try:
+        tdf = compute_temp_hotspot(df_win, window_days=2, baseline_days=30)  # GEOID,temp_score
+        return dict(zip(tdf["GEOID"].astype(str), tdf["temp_score"]))
+    except Exception:
+        return {}
+
+def _suggest_for_geoid(geoid: str, planned: int, risk_norm: float, temp_score: Optional[float]) -> str:
+    """
+    Basit öneri dili:
+      hedef ~ risk_norm * 12  (0..12 kaba ölçek)  → ±1 tolerans
+      temp_score >=1.5 ise artış cümlesi güçlenir
+    """
+    target = int(np.ceil(risk_norm * 12))
+    lo, hi = max(target-1, 0), max(target+1, 1)
+
+    why_bits = []
+    if temp_score is not None and np.isfinite(temp_score):
+        if temp_score >= 1.5:    why_bits.append("son 48 saatte belirgin artış")
+        elif temp_score >= 1.1:  why_bits.append("yakın dönemde hafif artış")
+    if   risk_norm >= 0.75:      why_bits.append("risk seviyesi yüksek")
+    elif risk_norm <= 0.25:      why_bits.append("risk seviyesi düşük")
+    why = "; ".join(why_bits) if why_bits else "son dönem risk özeti"
+
+    if planned < lo:
+        return f"GEOID {geoid}: {planned} planlı; {lo}–{hi} **düşünülebilir**. Neden: {why}."
+    if planned > hi:
+        return f"GEOID {geoid}: {planned} planlı; {lo}–{hi} düzeyine **azaltılabilir**. Neden: {why}."
+    return f"GEOID {geoid}: {planned} planlı; mevcut seviye **korunabilir**. Neden: {why}."
+
+# ---------- UI ----------
 def render():
     st.subheader("🧾 Raporlar & Operasyonel Öneriler")
 
     # veri
     try:
-        df, src = load_sf_crime_latest()
+        df_raw, _ = load_sf_crime_latest()
     except Exception as e:
-        st.error("Veri yüklenemedi.")
-        st.exception(e)
-        return
+        st.error("Veri yüklenemedi."); st.exception(e); return
+    df_raw = _ensure_time(df_raw)
 
-    # sol panel
-    left, mid, right = st.columns([1.15, 2.0, 1.2])
+    left, mid, right = st.columns([1.12, 1.8, 1.25])
+
+    # --- Sol: filtreler
     with left:
-        st.markdown("**Filtreler**")
-        period = st.radio("Rapor türü", ["Günlük","Haftalık","Aylık"], index=0,
-                          help="Günlük plan, haftalık özet, aylık değerlendirme")
-        dmin, dmax = _date_bounds(df)
-        start_def, end_def = _period_choice_to_range(period, dmax)
-        d1 = st.date_input("Başlangıç", value=start_def.date(), min_value=dmin.date(), max_value=dmax.date())
-        d2 = st.date_input("Bitiş", value=end_def.date(),   min_value=dmin.date(), max_value=dmax.date())
-        ccol = _category_col(df)
-        cats_all = sorted(df[ccol].dropna().astype(str).unique()) if ccol else []
-        pick_cats = st.multiselect("Suç türü filtresi", cats_all, default=[])
+        st.markdown("**Rapor türü & filtreler**")
+        period = st.radio("Rapor türü", ["Günlük", "Haftalık", "Aylık"], index=0)
+        latest = pd.to_datetime(df_raw["date"], errors="coerce").dropna().max() if "date" in df_raw.columns else pd.Timestamp.today()
+        ref_day = st.date_input("Referans gün", value=(latest.date() if pd.notnull(latest) else pd.Timestamp.today().date()))
+        d1, d2 = _period_to_range(period, pd.to_datetime(ref_day))
 
-        mode = st.radio("Gösterim", ["Planlanan devriyeler","Suç gerçekleşmeleri"], index=0,
-                        help="İcra edilen devriyeler ayrı log gelince eklenecek")
+        ccol = _category_col(df_raw)
+        cats = sorted(df_raw[ccol].dropna().astype(str).unique()) if ccol else []
+        pick_cats = st.multiselect("Suç türü (opsiyonel)", cats, default=[])
 
-    # veri kesiti
-    d1_ts, d2_ts = pd.to_datetime(d1), pd.to_datetime(d2)
-    dfw = _slice_df(df, d1_ts, d2_ts, pick_cats, ccol)
+        mode = st.radio("Gösterim", ["Planlanan devriyeler", "Suç gerçekleşmeleri"], index=0,
+                        help="İcra edilen devriyeler logu geldiğinde üçüncü seçenek eklenecek.")
+        k = st.number_input("Top-K GEOID", min_value=5, max_value=50, value=10, step=5)
 
-    # orta panel
+    # --- Veri kesiti
+    df_win = _slice_df(df_raw, d1, d2, pick_cats, ccol)
+    score_col = _pick_score_col(df_win)
+    geo_scores = _geo_aggregate(df_win, score_col)
+    planned_map = _planned_counts_by_geoid(d1, d2)
+    temp_map = _temp_hotspot_map(df_win)
+
+    # --- Orta panel
     with mid:
         if mode == "Planlanan devriyeler":
             st.markdown("**Planlanan devriyeler (onay kayıtları)**")
-            appr = list_approvals(limit=500)
-            df_appr = approvals_to_df(appr)
-            if len(df_appr) > 0:
-                st.dataframe(df_appr.sort_values("ts_sf", ascending=False), use_container_width=True, height=380)
+            appr_df = approvals_to_df(list_approvals(limit=1000))
+            if len(appr_df) > 0:
+                st.dataframe(appr_df.sort_values("ts_sf", ascending=False),
+                             use_container_width=True, height=380)
             else:
                 st.info("Henüz onay kaydı yok.")
         else:
             st.markdown("**Suç yoğunluğu özeti**")
-            # Top GEOID
-            top = spatial_top_geoid(dfw, n=15)
-            st.dataframe(top, use_container_width=True, height=220)
-            # Zamansal özet
-            sums = time_distributions(dfw)
-            st.caption("Saatlik dağılım")
-            st.line_chart(sums["by_hour"].set_index("event_hour"))
-            st.caption("Gün × saat ısı")
-            st.dataframe(sums["heat"].fillna(0).iloc[-7:, :], use_container_width=True, height=180)
+            top_geo = spatial_top_geoid(df_win, n=int(k))
+            st.dataframe(top_geo, use_container_width=True, height=220)
+            sums = time_distributions(df_win)
+            st.caption("Saatlik dağılım"); st.line_chart(sums["by_hour"].set_index("event_hour"))
+            st.caption("Gün × saat ısı (son 7 gün)"); st.dataframe(sums["heat"].fillna(0).iloc[-7:, :],
+                                                                  use_container_width=True, height=180)
 
-    # sağ panel — öneriler + indirme
+    # --- Sağ: öneriler + indirme
     with right:
-        st.markdown("**Öneriler (otomatik cümleler)**")
-        tips: List[str] = []
-        # basit kural: en üst 3 GEOID toplamın %X üzerindeyse artırılabilir
-        try:
-            ycol = "crime_count" if "crime_count" in dfw.columns else None
-            if mode != "Planlanan devriyeler" and ycol:
-                g15 = spatial_top_geoid(dfw, n=15)
-                total = float(dfw[ycol].sum())
-                top3 = float(g15.head(3)["value"].sum()) if len(g15) >= 3 else float(g15["value"].sum())
-                share = (top3 / total) if total > 0 else 0.0
-                if share >= 0.25:
-                    g_list = ", ".join(g15.head(3)["GEOID"].astype(str))
-                    tips.append(f"**{g_list}** hücrelerinde yoğunluk yüksek (ilk 3 ≈ %{share*100:.0f}). "
-                                f"Bu bölgelerde devriye **artırılabilir**.")
-                elif share <= 0.10 and total > 100:
-                    tips.append("Yoğunluk şehre daha dengeli yayılmış görünüyor; sabit plan **korunabilir**.")
-        except Exception:
-            pass
-
-        if tips:
-            for t in tips:
-                st.markdown(f"- {t}")
+        st.markdown("**Öneriler (olasılıklı dil)**")
+        if len(geo_scores) == 0:
+            st.caption("Liste boş.")
         else:
-            st.caption("Şimdilik otomatik öneri üretilmedi.")
+            topk = geo_scores.sort_values("risk_norm", ascending=False).head(int(k)).copy()
+            topk["planned"] = topk["GEOID"].astype(str).map(lambda g: planned_map.get(str(g), 0))
+            topk["temp_score"] = topk["GEOID"].astype(str).map(lambda g: temp_map.get(str(g), np.nan))
 
-        st.markdown("---")
-        st.markdown("**Rapor Çıkışı**")
-        # rapor dosyaları (CSV -> ZIP)
-        files: Dict[str, pd.DataFrame] = {}
+            for _, r in topk.iterrows():
+                s = _suggest_for_geoid(
+                    geoid=str(r["GEOID"]),
+                    planned=int(r.get("planned", 0) or 0),
+                    risk_norm=float(r.get("risk_norm", 0.0) or 0.0),
+                    temp_score=(None if pd.isna(r.get("temp_score", np.nan)) else float(r["temp_score"]))
+                )
+                st.write("• " + s)
 
-        # planlanan devriyeler
-        appr = approvals_to_df(list_approvals(limit=1000))
-        files["planned_approvals.csv"] = appr
+            st.markdown("---")
+            st.markdown("**Rapor Çıkışı**")
 
-        # suç özetleri
-        try:
-            sums = time_distributions(dfw)
-            br = offense_breakdown(dfw)
-            files["by_hour.csv"] = sums["by_hour"]
-            files["by_dow.csv"] = sums["by_dow"]
-            files["heatmatrix.csv"] = sums["heat"].reset_index().rename(columns={"index":"day"})
-            files["offense_breakdown.csv"] = br
-            top10 = spatial_top_geoid(dfw, n=10)
-            files["top10_geoid.csv"] = top10
-        except Exception:
-            pass
+            files: Dict[str, pd.DataFrame] = {}
+            # approvals
+            files["planned_approvals.csv"] = approvals_to_df(list_approvals(limit=1000))
+            # suç özetleri
+            try:
+                sums = time_distributions(df_win)
+                br = offense_breakdown(df_win)
+                files["by_hour.csv"] = sums["by_hour"]
+                files["by_dow.csv"] = sums["by_dow"]
+                files["heatmatrix.csv"] = sums["heat"].reset_index().rename(columns={"index":"day"})
+                files["offense_breakdown.csv"] = br
+                files["top{}_geoid.csv".format(int(k))] = spatial_top_geoid(df_win, n=int(k))
+            except Exception:
+                pass
 
-        csv_blobs = frames_to_csv_bytes(files)
-        zip_blob = pack_zip(csv_blobs)
-        st.download_button(
-            "⬇️ ZIP indir (CSV raporlar)",
-            data=zip_blob,
-            file_name=f"reports_{period.lower()}_{d1_ts.date()}_{d2_ts.date()}.zip",
-            mime="application/zip",
-            use_container_width=True
-        )
+            # Top-K tablo + öneriler ekle
+            out_sugg = topk[["GEOID", score_col, "risk_norm", "planned", "temp_score"]].copy()
+            out_sugg["suggestion"] = out_sugg.apply(
+                lambda r: _suggest_for_geoid(
+                    geoid=str(r["GEOID"]),
+                    planned=int(r.get("planned", 0) or 0),
+                    risk_norm=float(r.get("risk_norm", 0.0) or 0.0),
+                    temp_score=(None if pd.isna(r.get("temp_score", np.nan)) else float(r["temp_score"]))
+                ),
+                axis=1
+            )
+            files["topk_with_suggestions.csv"] = out_sugg
 
-        st.caption("PDF şablonu bir sonraki adımda eklenecek (builder.py genişletilecek).")
+            csv_blobs = frames_to_csv_bytes(files)
+            zip_blob = pack_zip(csv_blobs)
+            st.download_button(
+                "⬇️ ZIP indir (CSV raporlar)",
+                data=zip_blob,
+                file_name=f"reports_{period.lower()}_{d1.date()}_{d2.date()}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+
+    st.caption(
+        f"Aralık (SF): {d1.strftime('%Y-%m-%d')} → {d2.strftime('%Y-%m-%d')} • "
+        f"Skor: {score_col} • Plan kaynağı: approvals.jsonl"
+    )
