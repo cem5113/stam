@@ -3,74 +3,135 @@ from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import numpy as np
-from typing import Tuple, Optional
-from features.near_repeat import compute_temp_hotspot, compute_stable_hotspot
+from typing import Tuple, Optional, List
 
 from config.settings import RISK_THRESHOLDS
 from dataio.loaders import load_sf_crime_latest
 from services.tz import now_sf_str
 
-# ---------- helpers ----------
+# (Varsa) geçici/kalıcı hotspot fonksiyonlarını kullan; yoksa sessizce atla
+try:
+    from features.near_repeat import compute_temp_hotspot, compute_stable_hotspot
+except Exception:
+    compute_temp_hotspot = None
+    compute_stable_hotspot = None
+
+# ----------------- helpers -----------------
 def _pick_category_col(df: pd.DataFrame) -> Optional[str]:
     for c in ["category_grouped", "category", "subcategory_grouped", "subcategory", "crime_type"]:
-        if c in df.columns: return c
+        if c in df.columns:
+            return c
     return None
 
-def _risk_level(p: float) -> str:
-    if np.isnan(p): return "Bilinmiyor"
+def _risk_level_from_p(p: float) -> str:
+    if p is None or np.isnan(p):
+        return "Bilinmiyor"
     return "Yüksek" if p > RISK_THRESHOLDS["mid"] else ("Orta" if p > RISK_THRESHOLDS["low"] else "Düşük")
 
 def _confidence_label(q10: float, q90: float) -> str:
-    if np.isnan(q10) or np.isnan(q90): return "—"
-    spread = q90 - q10
-    if spread <= 0.5: return "Yüksek güven"
-    if spread <= 1.5: return "Orta güven"
+    if np.isnan(q10) or np.isnan(q90):
+        return "—"
+    spread = float(q90) - float(q10)
+    if spread <= 0.5:  return "Yüksek güven"
+    if spread <= 1.5:  return "Orta güven"
     return "Düşük güven"
 
 def _latlon_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    cand = [("lat","lon"), ("latitude","longitude"), ("y","x"), ("LAT","LON")]
-    for y,x in cand:
-        if y in df.columns and x in df.columns:
-            return y, x
+    cands = [("lat", "lon"), ("latitude", "longitude"), ("y", "x"), ("LAT", "LON")]
+    for latc, lonc in cands:
+        if latc in df.columns and lonc in df.columns:
+            return latc, lonc
     return None, None
 
-def _expected_col(df: pd.DataFrame) -> str:
-    # Tercih sırası: pred_expected → pred_p_occ (olasılık) → crime_count
-    if "pred_expected" in df.columns: return "pred_expected"
-    if "pred_p_occ"   in df.columns: return "pred_p_occ"
-    return "crime_count" if "crime_count" in df.columns else df.columns[0]
-
-def _agg_for_window(df: pd.DataFrame, by_cols: list, val_col: str) -> pd.DataFrame:
-    # sum for counts/expected; mean for probability columns
-    if val_col == "pred_p_occ":
-        agg = df.groupby(by_cols, as_index=False)[val_col].mean()
-    else:
-        agg = df.groupby(by_cols, as_index=False)[val_col].sum()
-    return agg
-
-def _prepare_topk(df: pd.DataFrame, score_col: str, k: int = 10) -> pd.DataFrame:
+def _ensure_time_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if score_col == "pred_p_occ":
-        out["risk_level"] = out[score_col].map(_risk_level)
+    if "date" not in out.columns and "datetime" in out.columns:
+        out["date"] = pd.to_datetime(out["datetime"], errors="coerce").dt.date
+    if "event_hour" not in out.columns:
+        if "datetime" in out.columns:
+            out["event_hour"] = pd.to_datetime(out["datetime"], errors="coerce").dt.hour
+        else:
+            out["event_hour"] = 0
+    return out
+
+def _fallback_proxy_risk(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tahmin kolonları yoksa: son 7 güne göre GEOID bazlı normalize (0..1) 'p_proxy'.
+    """
+    dff = _ensure_time_cols(df)
+    if "date" not in dff.columns:
+        dff["p_proxy"] = 0.0
+        return dff
+    dff["date"] = pd.to_datetime(dff["date"], errors="coerce")
+    dmax = dff["date"].max()
+    if pd.isna(dmax):
+        dff["p_proxy"] = 0.0
+        return dff
+    sub = dff[(dff["date"] >= dmax - pd.Timedelta(days=7)) & (dff["date"] <= dmax)].copy()
+    ycol = "crime_count" if "crime_count" in sub.columns else None
+    if ycol is None:
+        sub["__ones"] = 1
+        ycol = "__ones"
+    g = sub.groupby("GEOID", as_index=False)[ycol].sum().rename(columns={ycol: "recent_sum"})
+    mx = float(g["recent_sum"].max()) if len(g) else 1.0
+    g["p_proxy"] = g["recent_sum"] / (mx if mx > 0 else 1.0)
+    out = dff.merge(g[["GEOID", "p_proxy"]], on="GEOID", how="left")
+    out["p_proxy"] = out["p_proxy"].fillna(0.0)
+    return out
+
+def _pick_score_col(df: pd.DataFrame) -> str:
+    # Öncelik: pred_p_occ (olasılık) > pred_expected (normalize edilip 0..1) > p_proxy > crime_count
+    if "pred_p_occ" in df.columns:      return "pred_p_occ"
+    if "pred_expected" in df.columns:   return "pred_expected"
+    if "p_proxy" in df.columns:         return "p_proxy"
+    if "crime_count" in df.columns:     return "crime_count"
+    # fallback: ilk sayısal kolon
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    return num_cols[0] if num_cols else df.columns[0]
+
+def _summarize_window_geoid(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
+    """
+    Zaman penceresine indirgenmiş df'yi GEOID bazında tek skora çevirir:
+    - Olasılık ('pred_p_occ' / 'p_proxy'): mean
+    - Beklenen sayı ('pred_expected') veya sayım: sum
+    """
+    dfx = df.copy()
+    if score_col in ("pred_p_occ", "p_proxy"):
+        g = dfx.groupby("GEOID", as_index=False)[score_col].mean()
     else:
-        # normalize to [0,1] for level — kaba ölçek
-        m = out[score_col].max() or 1.0
-        out["risk_level"] = (out[score_col] / m).clip(0,1).map(_risk_level)
-    # güven etiketi
-    if {"pred_q10","pred_q90"}.issubset(out.columns):
-        out["güven"] = [_confidence_label(q10, q90) for q10,q90 in zip(out["pred_q10"], out["pred_q90"])]
+        g = dfx.groupby("GEOID", as_index=False)[score_col].sum()
+    return g
+
+def _normalize_0_1(s: pd.Series) -> pd.Series:
+    mx = float(s.max()) if len(s) else 1.0
+    return (s / (mx if mx > 0 else 1.0)).clip(0, 1)
+
+def _prepare_topk(geo_scores: pd.DataFrame, score_col: str, k: int = 10,
+                  q10: Optional[pd.Series] = None, q90: Optional[pd.Series] = None) -> pd.DataFrame:
+    out = geo_scores.copy()
+    # risk seviyesi: olasılık kolonları için doğrudan, diğerlerinde normalize ederek
+    if score_col in ("pred_p_occ", "p_proxy"):
+        out["risk_level"] = out[score_col].map(_risk_level_from_p)
+    else:
+        out["risk_norm"] = _normalize_0_1(out[score_col])
+        out["risk_level"] = out["risk_norm"].map(_risk_level_from_p)
+
+    # güven etiketi (varsa)
+    if q10 is not None and q90 is not None and len(q10) == len(out) == len(q90):
+        out["güven"] = [_confidence_label(a, b) for a, b in zip(q10.values, q90.values)]
     else:
         out["güven"] = "—"
+
     cols = ["GEOID", score_col, "risk_level", "güven"]
     keep = [c for c in cols if c in out.columns]
-    return (out[keep].sort_values(score_col, ascending=False).head(k))
+    return out[keep].sort_values(score_col, ascending=False).head(k)
 
-# ---------- UI ----------
+# ----------------- UI -----------------
 def render():
     st.subheader("🧭 Suç Tahmini")
     st.caption(f"Son kontrol: {now_sf_str()} (SF)")
 
-    # Veri yükle
+    # --- Veri yükle ---
     try:
         df_raw, src = load_sf_crime_latest()
     except Exception as e:
@@ -78,9 +139,12 @@ def render():
         st.exception(e)
         return
 
-    # Filtre paneli
-    left, mid, right = st.columns([1.1, 2.2, 1.2])
+    # Tahmin kolonları yoksa proxy oluştur
+    if not any(c in df_raw.columns for c in ("pred_p_occ", "pred_expected", "pred_q50")):
+        df_raw = _fallback_proxy_risk(df_raw)
 
+    # Sol panel (filtreler)
+    left, mid, right = st.columns([1.1, 2.2, 1.2])
     with left:
         st.markdown("**Zaman Penceresi**")
         win = st.radio(
@@ -90,97 +154,51 @@ def render():
             help="SF saatine göre pencereler",
         )
 
-        # referans tarih — mevcut verinin en güncel günü
+        # referans tarih
+        latest = None
         if "date" in df_raw.columns:
             latest = pd.to_datetime(df_raw["date"], errors="coerce").dropna().max()
-        else:
-            latest = pd.Timestamp.today()
-        d_pick = st.date_input("Referans gün", value=latest.date() if pd.notnull(latest) else pd.Timestamp.today().date())
+        d_pick = st.date_input(
+            "Referans gün",
+            value=(latest.date() if pd.notnull(latest) and latest is not None else pd.Timestamp.today().date()),
+        )
 
         # kategori filtresi
         cat_col = _pick_category_col(df_raw)
         cats = sorted(df_raw[cat_col].dropna().unique()) if cat_col else []
-        pick_cats = st.multiselect("Suç kategorisi", cats, default=[], help="Boş = tüm kategoriler")
+        pick_cats: List[str] = st.multiselect("Suç kategorisi", cats, default=[], help="Boş bırak = tüm kategoriler")
 
         st.markdown("**Harita Katmanları**")
         layer_risk   = st.checkbox("Tahmin katmanı (risk)", True)
         layer_temp   = st.checkbox("Geçici hotspot", True)
         layer_stable = st.checkbox("Kalıcı hotspot", True)
 
-    # --- hotspot skorları
-    temp_df = compute_temp_hotspot(df, window_days=2, baseline_days=30)
-    stab_df = compute_stable_hotspot(df, horizon_days=90)
-    
-    # --- harita katmanı oluştururken:
-    geo_last = agg.groupby("GEOID", as_index=False)[score_col].max()
-    centroids = df_raw.groupby("GEOID", as_index=False)[[lat_col, lon_col]].first()
-    view = centroids.merge(geo_last, on="GEOID", how="left")
-    
-    # katman veri kaynakları (opsiyonel)
-    view_temp = view.merge(temp_df, on="GEOID", how="left").dropna(subset=["temp_score"])
-    view_stab = view.merge(stab_df, on="GEOID", how="left").dropna(subset=["stable_score"])
-    
-    layers = [{
-        "@@type": "ScatterplotLayer",
-        "data": view.to_dict("records"),
-        "get_position": f"[{lon_col}, {lat_col}]",
-        "get_radius": 80,
-        "pickable": True,
-        "opacity": 0.7,
-        "get_fill_color": "[255, (1-level)*200, (1-level)*100]"  # risk katmanı
-    }]
-    
-    if layer_temp and len(view_temp) > 0:
-        layers.append({
-            "@@type": "ScatterplotLayer",
-            "data": view_temp.to_dict("records"),
-            "get_position": f"[{lon_col}, {lat_col}]",
-            "get_radius": 110,
-            "pickable": True,
-            "opacity": 0.35,
-            "get_fill_color": "[255, 140, 0]"  # turuncu: geçici hotspot
-        })
-    
-    if layer_stable and len(view_stab) > 0:
-        layers.append({
-            "@@type": "ScatterplotLayer",
-            "data": view_stab.to_dict("records"),
-            "get_position": f"[{lon_col}, {lat_col}]",
-            "get_radius": 60,
-            "pickable": True,
-            "opacity": 0.35,
-            "get_fill_color": "[0, 128, 255]"  # mavi: kalıcı hotspot
-        })
-    
-    st.pydeck_chart({
-        "initialViewState": {"latitude": float(view[lat_col].mean()),
-                             "longitude": float(view[lon_col].mean()),
-                             "zoom": 11},
-        "layers": layers,
-        "mapProvider": "carto"
-    })
+        k_top = st.number_input("Top-K liste", min_value=5, max_value=50, value=10, step=5)
 
-    
-    # Veri hazırlığı (pencereye göre)
+    # Filtre uygula (kategori)
     df = df_raw.copy()
-    if cat_col and len(pick_cats) > 0:
+    if cat_col and pick_cats:
         df = df[df[cat_col].isin(pick_cats)]
 
+    # Tarih-saat alanlarını hazırla
+    df = _ensure_time_cols(df)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    score_col = _expected_col(df)
+    # Skor kolonu
+    score_col = _pick_score_col(df)
 
+    # Seçilen pencereye göre veri altkümesi
     if win.startswith("0–24"):
-        # seçilen günün saatleri
-        mask = df["date"].dt.date == pd.to_datetime(d_pick).date() if "date" in df.columns else np.full(len(df), True)
-        df_win = df[mask].copy()
-        if "event_hour" not in df_win.columns:
-            df_win["event_hour"] = 0
-        agg = _agg_for_window(df_win, by_cols=["GEOID","event_hour"], val_col=score_col)
+        # seçilen gün (00:00–23:59)
+        if "date" in df.columns:
+            mask = df["date"].dt.date == pd.to_datetime(d_pick).date()
+            df_win = df[mask].copy()
+        else:
+            df_win = df.copy()
 
     elif win.startswith("72"):
-        # son 72 saat → 6’şar saatlik blok
+        # referans günün sonuna kadar 72 saat geriye
         end = pd.to_datetime(d_pick) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
         start = end - pd.Timedelta(hours=72)
         if "date" in df.columns:
@@ -188,15 +206,9 @@ def render():
             df_win = df[mask].copy()
         else:
             df_win = df.copy()
-        # block id
-        if "event_hour" in df_win.columns:
-            df_win["block6h"] = (df_win["event_hour"] // 6).astype(int)
-        else:
-            df_win["block6h"] = 0
-        agg = _agg_for_window(df_win, by_cols=["GEOID","block6h"], val_col=score_col)
 
     else:
-        # 1 hafta → gün bazlı
+        # 1 hafta (günlük)
         end = pd.to_datetime(d_pick)
         start = end - pd.Timedelta(days=6)
         if "date" in df.columns:
@@ -204,81 +216,156 @@ def render():
             df_win = df[mask].copy()
         else:
             df_win = df.copy()
-        if "date" in df_win.columns:
-            agg = _agg_for_window(df_win, by_cols=["GEOID","date"], val_col=score_col)
-        else:
-            agg = _agg_for_window(df_win, by_cols=["GEOID"], val_col=score_col)
 
-    # Top-K tablo
-    topk = _prepare_topk(agg if "GEOID" in agg.columns else df, score_col=score_col, k=10)
+    # GEOID bazında tek skor
+    geo_scores = _summarize_window_geoid(df_win, score_col=score_col)
 
+    # Top-K tablo (güven etiketini varsa kullan)
+    q10 = q90 = None
+    if {"pred_q10", "pred_q90"}.issubset(df_win.columns):
+        # GEOID bazında q10/q90 için mean alın (hızlı özet)
+        q10 = df_win.groupby("GEOID")["pred_q10"].mean()
+        q90 = df_win.groupby("GEOID")["pred_q90"].mean()
+        # align
+        geo_scores = geo_scores.merge(q10.rename("q10"), on="GEOID", how="left")
+        geo_scores = geo_scores.merge(q90.rename("q90"), on="GEOID", how="left")
+        topk = _prepare_topk(geo_scores, score_col=score_col, k=int(k_top),
+                             q10=geo_scores["q10"], q90=geo_scores["q90"])
+    else:
+        topk = _prepare_topk(geo_scores, score_col=score_col, k=int(k_top))
+
+    # Orta panel — Harita
     with mid:
-        st.markdown("**Tahmin Haritası / Önizleme**")
+        st.markdown("**Tahmin Haritası**")
         lat_col, lon_col = _latlon_columns(df_raw)
-        if lat_col and lon_col:
-            # GEOID bazlı son skor (agg’den max/sum)
-            geo_last = agg.groupby("GEOID", as_index=False)[score_col].max()
-            # birleştir (ilk görülen lat/lon)
-            centroids = df_raw.groupby("GEOID", as_index=False)[[lat_col, lon_col]].first()
-            view = centroids.merge(geo_last, on="GEOID", how="left")
-            # renk seviyesi (0-1)
-            vmax = view[score_col].max() or 1.0
-            view["level"] = (view[score_col] / vmax).clip(0,1)
+        if lat_col and lon_col and "GEOID" in df_raw.columns:
+            # GEOID → tekil koordinat (ilk/ortalama)
+            centroids = (
+                df_raw.groupby("GEOID", as_index=False)[[lat_col, lon_col]]
+                .mean(numeric_only=True)
+                .dropna()
+            )
+            view = centroids.merge(geo_scores, on="GEOID", how="left")
+            # 0..1 seviye (olasılık ise direkt kullan, değilse normalize)
+            if score_col in ("pred_p_occ", "p_proxy"):
+                view["level"] = view[score_col].clip(0, 1)
+            else:
+                view["level"] = _normalize_0_1(view[score_col])
+
+            # Hotspot katmanları (opsiyonel, mevcutsa)
+            layers = []
             tooltip = {
-                "html": "<b>GEOID:</b> {GEOID} <br/> <b>Skor:</b> {"
-                        + score_col + "} <br/> <b>Seviye:</b> {level}",
-                "style": {"backgroundColor": "rgba(30,30,30,0.8)", "color": "white"}
+                "html": "<b>GEOID:</b> {GEOID}<br/>"
+                        f"<b>Skor:</b> {{{score_col}}}<br/>"
+                        "<b>Seviye(0–1):</b> {level}",
+                "style": {"backgroundColor": "rgba(30,30,30,0.85)", "color": "white"}
             }
-            st.pydeck_chart({
-                "initialViewState": {"latitude": float(view[lat_col].mean()),
-                                     "longitude": float(view[lon_col].mean()),
-                                     "zoom": 11},
-                "layers": [{
+
+            if layer_risk:
+                layers.append({
                     "@@type": "ScatterplotLayer",
                     "data": view.to_dict("records"),
                     "get_position": f"[{lon_col}, {lat_col}]",
-                    "get_radius": 80,
+                    "get_radius": 90,
                     "pickable": True,
                     "opacity": 0.7,
                     "get_fill_color": "[255, (1-level)*200, (1-level)*100]"
-                }],
-                "tooltip": tooltip,
-                "mapProvider": "carto"
-            })
-            st.caption("Not: Poligon katmanı yerine **nokta/centroid** ile önizleme. Grid geometri gelince PolygonLayer’a geçilecek.")
+                })
+
+            # Geçici hotspot
+            if layer_temp and compute_temp_hotspot is not None:
+                try:
+                    temp_df = compute_temp_hotspot(df_raw, window_days=2, baseline_days=30)  # beklenen: GEOID, temp_score
+                    if temp_df is not None and "GEOID" in temp_df.columns:
+                        view_temp = view.merge(temp_df, on="GEOID", how="left").dropna(subset=["temp_score"])
+                        if len(view_temp) > 0:
+                            layers.append({
+                                "@@type": "ScatterplotLayer",
+                                "data": view_temp.to_dict("records"),
+                                "get_position": f"[{lon_col}, {lat_col}]",
+                                "get_radius": 120,
+                                "pickable": True,
+                                "opacity": 0.35,
+                                "get_fill_color": "[255,140,0]"
+                            })
+                except Exception:
+                    st.caption("Geçici hotspot hesaplanamadı (near_repeat modülü).")
+
+            # Kalıcı hotspot
+            if layer_stable and compute_stable_hotspot is not None:
+                try:
+                    stab_df = compute_stable_hotspot(df_raw, horizon_days=90)  # beklenen: GEOID, stable_score
+                    if stab_df is not None and "GEOID" in stab_df.columns:
+                        view_stab = view.merge(stab_df, on="GEOID", how="left").dropna(subset=["stable_score"])
+                        if len(view_stab) > 0:
+                            layers.append({
+                                "@@type": "ScatterplotLayer",
+                                "data": view_stab.to_dict("records"),
+                                "get_position": f"[{lon_col}, {lat_col}]",
+                                "get_radius": 70,
+                                "pickable": True,
+                                "opacity": 0.35,
+                                "get_fill_color": "[0,128,255]"
+                            })
+                except Exception:
+                    st.caption("Kalıcı hotspot hesaplanamadı (near_repeat modülü).")
+
+            if layers:
+                st.pydeck_chart({
+                    "initialViewState": {
+                        "latitude": float(view[lat_col].mean()),
+                        "longitude": float(view[lon_col].mean()),
+                        "zoom": 11
+                    },
+                    "layers": layers,
+                    "tooltip": tooltip,
+                    "mapProvider": "carto"
+                })
+            else:
+                st.info("Harita katmanı yok (seçili katmanlar kapalı olabilir).")
         else:
             st.info("Harita için lat/lon kolonları bulunamadı. (lat/lon veya latitude/longitude beklenir)")
-            st.dataframe(topk, use_container_width=True)
 
+    # Sağ panel — Top-K & GEOID detay
     with right:
-        st.markdown("**Top-10 kritik GEOID**")
-        st.dataframe(topk, use_container_width=True)
-        st.caption("Seviyeler: Yüksek / Orta / Düşük • Güven: q10–q90 yayılımından türetilir (varsa).")
+        st.markdown("**Top-{} kritik GEOID**".format(int(k_top)))
+        st.dataframe(topk, use_container_width=True, height=360)
+        st.caption("Seviye: Yüksek / Orta / Düşük • Güven: q10–q90 yayılımı (varsa).")
 
         st.download_button(
-            "⬇️ Top-10 CSV",
+            "⬇️ Top-{} CSV".format(int(k_top)),
             data=topk.to_csv(index=False).encode("utf-8"),
-            file_name="top10_geoid.csv",
+            file_name="top{}_geoid.csv".format(int(k_top)),
             mime="text/csv"
         )
-                
-        st.markdown("**Seçili GEOID detay (örnek)**")
-        pick = st.selectbox("GEOID seç", topk["GEOID"] if "GEOID" in topk.columns else [])
-        if pick:
-            sub = df[df["GEOID"] == pick].copy()
-            cols = [c for c in ["date","event_hour","crime_count","pred_p_occ","pred_q10","pred_q50","pred_q90","pred_expected"] if c in sub.columns]
-            with st.expander(f"{pick} – Son kayıtlar", expanded=False):
-                st.dataframe(sub[cols].tail(30), use_container_width=True)
-            if pick:
-                sub_daily = (
-                    sub.assign(day=sub["date"].dt.date)
-                       .groupby("day", as_index=False)[score_col].sum()
-                    if "date" in sub.columns else None
-                )
-                if sub_daily is not None and len(sub_daily) > 0:
-                    sub_daily = sub_daily.sort_values("day").tail(14)
-                    st.line_chart(sub_daily.set_index("day")[score_col])
-                else:
-                    st.caption("Trend için yeterli tarih verisi yok.")
 
-    st.caption("🧪 Bu sekme iskeleti: katman anahtarları ve XAI kısa notları sonraki adımda popup/sağ panelde gösterilecek.")
+        st.markdown("**Seçili GEOID detay**")
+        pick = st.selectbox("GEOID seç", topk["GEOID"] if "GEOID" in topk.columns else [])
+        if pick is not None and "GEOID" in df.columns:
+            sub = df[df["GEOID"] == pick].copy()
+            # kısa metrikler
+            if score_col in ("pred_p_occ", "p_proxy"):
+                p = float(np.nanmean(sub[score_col])) if len(sub) else np.nan
+                st.metric("Tahmin seviyesi", _risk_level_from_p(p))
+                st.metric("Risk skoru (0–1)", f"{p:.2f}" if not np.isnan(p) else "—")
+            else:
+                total = float(np.nansum(sub[score_col])) if len(sub) else np.nan
+                norm = 0.0 if np.isnan(total) else total
+                st.metric("Beklenen/Toplam skor", f"{norm:.2f}")
+
+            # gerçekleşen (varsa)
+            if "date" in sub.columns:
+                sub["date"] = pd.to_datetime(sub["date"], errors="coerce")
+                dmax = sub["date"].max()
+                if "crime_count" in sub.columns and pd.notna(dmax):
+                    s7  = sub[sub["date"] >= dmax - pd.Timedelta(days=7)]["crime_count"].sum()
+                    s30 = sub[sub["date"] >= dmax - pd.Timedelta(days=30)]["crime_count"].sum()
+                    st.metric("Son 7 gün", int(s7))
+                    st.metric("Son 30 gün", int(s30))
+
+            # kısa trend
+            if "date" in sub.columns:
+                sub_day = sub.assign(day=sub["date"].dt.date).groupby("day", as_index=False)[score_col].sum()
+                if len(sub_day) > 0:
+                    sub_day = sub_day.sort_values("day").tail(14)
+                    st.line_chart(sub_day.set_index("day")[score_col], height=160)
