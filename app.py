@@ -3,6 +3,7 @@ from __future__ import annotations
 import streamlit as st
 from ui.tab_forecast import render as render_forecast
 from ui.tab_stats import render as render_stats
+from ui.tab_planning import render as render_planning
 
 st.set_page_config(page_title="SUTAM", layout="wide")
 
@@ -31,7 +32,11 @@ with tabs[0]:
     render_home()
 
 with tabs[1]:
-    st.info("🚧 Devriye Planlama burada olacak (bir sonraki adımda ekleyeceğiz).")
+    try:
+        render_planning()
+    except Exception as e:
+        st.error("Devriye Planlama yüklenemedi.")
+        st.exception(e)
 
 with tabs[2]:
     try:
@@ -42,7 +47,6 @@ with tabs[2]:
 
 with tabs[3]:
     try:
-        from ui.tab_stats import render as render_stats
         render_stats()
     except Exception as e:
         st.error("Suç İstatistikleri modülü yüklenemedi.")
