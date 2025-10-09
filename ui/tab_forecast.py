@@ -10,7 +10,7 @@ from dataio.loaders import load_sf_crime_latest
 from services.tz import now_sf_str
 
 # Tahmin kolonlarını eksiksizleştir
-from models.predictor import ensure_predictions
+from sutam.models.predictor import ensure_predictions
 
 # XAI (opsiyonel)
 try:
