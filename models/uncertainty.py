@@ -13,7 +13,13 @@ def risk_level_from_prob(p: float, thresholds: Dict[str, float]) -> str:
     p: gerçekleşme olasılığı (0..1)
     thresholds: {"low": 0.33, "mid": 0.66, ...}
     """
-    if p is None or (isinstance(p, float) and np.isnan(p)):
+    if p is None:
+        return "Bilinmiyor"
+    try:
+        p = float(p)
+    except Exception:
+        return "Bilinmiyor"
+    if np.isnan(p):
         return "Bilinmiyor"
     low = float(thresholds.get("low", 0.33))
     mid = float(thresholds.get("mid", 0.66))
@@ -51,16 +57,20 @@ def add_confidence_cols(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # 1) Poisson → P(N>=1) yardımcıları
 # ============================================================
-def lambda_to_p_occ(lam: np.ndarray | float) -> np.ndarray:
+def lambda_to_p_occ(lam: np.ndarray | pd.Series | float) -> np.ndarray:
     """Poisson varsayımı: P(N>=1) = 1 - exp(-λ)."""
     arr = np.asarray(lam, dtype=float)
-    return 1.0 - np.exp(-np.clip(arr, 0.0, None))
+    arr = np.clip(arr, 0.0, None)
+    return 1.0 - np.exp(-arr)
 
 # ============================================================
 # 2) Hızlı (vektörel) normal yaklaşımı kantilleri
 #    q ≈ λ + z * sqrt(λ)   (kontinü düzeltme ihmal)
 # ============================================================
-def poisson_normal_quantiles(lam: Iterable[float], qs: Tuple[float, ...] = (0.1, 0.5, 0.9)) -> np.ndarray:
+def poisson_normal_quantiles(
+    lam: Iterable[float],
+    qs: Tuple[float, ...] = (0.1, 0.5, 0.9)
+) -> np.ndarray:
     """
     Poisson için hızlı normal yaklaşımı: q ≈ λ + z * sqrt(λ), λ>=0.
     SciPy olmadan hafif ve vektörel.
@@ -68,17 +78,19 @@ def poisson_normal_quantiles(lam: Iterable[float], qs: Tuple[float, ...] = (0.1,
     """
     lam = np.asarray(list(lam), dtype=float)
     lam = np.clip(lam, 0.0, None)
+
     # z-skorları
     try:
         from statistics import NormalDist
         zs = np.array([NormalDist().inv_cdf(q) for q in qs], dtype=float)
     except Exception:
-        # Çok nadir: NormalDist yoksa yaklaşıksal sabitler (0.1,0.5,0.9)
+        # Yedek: sık kullanılan quantile'lar için sabitler
         z_map = {0.1: -1.2815515655, 0.5: 0.0, 0.9: 1.2815515655}
         zs = np.array([z_map.get(float(q), 0.0) for q in qs], dtype=float)
-    root = np.sqrt(np.maximum(lam, 1e-9))
-    # (len(lam), len(qs)) döndür
-    return np.maximum(0.0, lam[:, None] + root[:, None] * zs[None, :])
+
+    root = np.sqrt(np.maximum(lam, 1e-12))
+    q = lam[:, None] + root[:, None] * zs[None, :]
+    return np.maximum(0.0, q)
 
 def attach_poisson_quantiles(df: pd.DataFrame, lambda_col: str = "pred_expected") -> pd.DataFrame:
     """
@@ -121,21 +133,23 @@ def poisson_quantile(lam: float, q: float) -> int:
     if lam >= 50 and q in _Z:
         val = lam + _Z[q] * math.sqrt(lam)
         return max(0, int(round(val)))
-    # artan arama
+    # artan arama (küçük λ güvenli)
     k = 0
     k_max = int(max(10, lam + 10 * math.sqrt(max(lam, 1.0))))
     while k < k_max and _poisson_cdf(k, lam) < q:
         k += 1
     return k
 
-def poisson_quantiles(lam: Iterable[float],
-                      qs: Tuple[float, float, float] = (0.1, 0.5, 0.9)) -> pd.DataFrame:
+def poisson_quantiles(
+    lam: Iterable[float],
+    qs: Tuple[float, float, float] = (0.1, 0.5, 0.9)
+) -> pd.DataFrame:
     """
     Çoklu λ için q10/q50/q90 kantilleri (DataFrame döner).
     """
     recs: List[dict] = []
     for L in lam:
-        Lf = float(max(0.0, L))
+        Lf = float(max(0.0, float(L)))
         q10 = poisson_quantile(Lf, qs[0])
         q50 = poisson_quantile(Lf, qs[1])
         q90 = poisson_quantile(Lf, qs[2])
@@ -148,7 +162,7 @@ def poisson_quantiles(lam: Iterable[float],
 def add_poisson_uncertainty(df: pd.DataFrame, lam_col: str = "pred_expected") -> pd.DataFrame:
     """
     pred_expected (λ) → {pred_q10,pred_q50,pred_q90} ve (yoksa) pred_p_occ = 1 - e^{-λ}.
-    (Küçük λ'da daha doğru olan poisson_quantiles kullanır.)
+    Küçük λ'larda daha doğru olan poisson_quantiles kullanır.
     """
     out = df.copy()
     if lam_col not in out.columns:
@@ -158,6 +172,7 @@ def add_poisson_uncertainty(df: pd.DataFrame, lam_col: str = "pred_expected") ->
     out["pred_q10"] = qs["q10"].values
     out["pred_q50"] = qs["q50"].values
     out["pred_q90"] = qs["q90"].values
+
     # olay gerçekleşme olasılığı: 1 - P(X=0) = 1 - e^{-λ}
     if "pred_p_occ" not in out.columns:
         out["pred_p_occ"] = np.nan
