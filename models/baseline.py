@@ -1,8 +1,10 @@
 # models/baseline.py
 from __future__ import annotations
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Iterable
 import numpy as np
 import pandas as pd
+
+from models.uncertainty import poisson_quantiles, prob_at_least_one
 
 # ---------------------------------------------------------------------
 # Yardımcılar
@@ -44,12 +46,12 @@ def _y_col(df: pd.DataFrame) -> str:
     df["_ones"] = 1
     return "_ones"
 
-# Eski adla geriye dönük uyumluluk (ilk sürümde _ycol idi)
+# Eski adla geriye dönük uyumluluk
 _ycol = _y_col
 
 def _pick_y(df: pd.DataFrame) -> str:
     """
-    Skor için tercih sırası:
+    Skor/etiket için tercih sırası:
       1) pred_expected
       2) pred_p_occ
       3) crime_count
@@ -62,7 +64,67 @@ def _pick_y(df: pd.DataFrame) -> str:
     return nums[0] if nums else df.columns[0]
 
 # ---------------------------------------------------------------------
-# 1) Frekans-temelli baseline (λ tahmini)
+# 0) Kolay kullanım: Poisson tabanlı baseline (UI ile tam uyumlu)
+# ---------------------------------------------------------------------
+def baseline_expected(df_raw: pd.DataFrame, lookback_days: int = 30) -> pd.DataFrame:
+    """
+    Çok hafif Poisson baseline:
+      - Son 'lookback_days' içinde GEOID×hour ortalama olay sayısı -> pred_expected
+      - Fallback: GEOID ort. → (yoksa) şehir ort. + saat etkisi
+      - pred_p_occ = 1 - exp(-pred_expected)
+      - pred_q10/q50/q90 = Poisson kuantilleri
+    """
+    df = _ensure_time(df_raw)
+    ycol = _y_col(df)
+
+    # lookback penceresi
+    if "date" in df.columns and df["date"].notna().any():
+        dmax = df["date"].max()
+        dmin = dmax - pd.Timedelta(days=lookback_days - 1)
+        hist = df[(df["date"] >= dmin) & (df["date"] <= dmax)].copy()
+    else:
+        hist = df.copy()
+
+    # GEOID×hour ortalamaları
+    geo_hour = (hist.groupby(["GEOID", "event_hour"], as_index=False)[ycol]
+                    .mean().rename(columns={ycol: "mu_geo_hour"}))
+    # GEOID ortalamaları
+    geo_mu = (hist.groupby("GEOID", as_index=False)[ycol]
+                 .mean().rename(columns={ycol: "mu_geo"}))
+    # şehir ortalaması
+    g_city = float(pd.to_numeric(hist[ycol], errors="coerce").fillna(0).mean())
+
+    # saat etkisi (varsa)
+    by_hour = (hist.groupby("event_hour", as_index=False)[ycol]
+                  .mean().rename(columns={ycol: "mu_hour"}))
+    hour_map = by_hour.set_index("event_hour")["mu_hour"].to_dict() if len(by_hour) else {}
+
+    out = df.copy()
+    out = out.merge(geo_hour, on=["GEOID", "event_hour"], how="left")
+    out = out.merge(geo_mu, on="GEOID", how="left")
+
+    # hiyerarşik fallback
+    out["pred_expected"] = np.where(
+        out["mu_geo_hour"].notna(), out["mu_geo_hour"],
+        np.where(
+            out["mu_geo"].notna(), out["mu_geo"],
+            pd.Series([hour_map.get(int(h), g_city) for h in out["event_hour"]], index=out.index)
+        )
+    ).astype(float)
+
+    # Olasılık & Poisson kuantilleri
+    out["pred_p_occ"] = out["pred_expected"].map(lambda lam: prob_at_least_one(float(max(lam, 0.0))))
+    qs = out["pred_expected"].map(lambda lam: poisson_quantiles(float(max(lam, 0.0))))
+    out["pred_q10"] = qs.map(lambda d: d.get("q10", 0))
+    out["pred_q50"] = qs.map(lambda d: d.get("q50", 0))
+    out["pred_q90"] = qs.map(lambda d: d.get("q90", 0))
+
+    # temizlik
+    out.drop(columns=["mu_geo_hour", "mu_geo"], inplace=True, errors="ignore")
+    return out
+
+# ---------------------------------------------------------------------
+# 1) Frekans-temelli baseline (λ haftalık oran)
 # ---------------------------------------------------------------------
 def fit_frequency_baseline(
     df_raw: pd.DataFrame,
@@ -72,12 +134,12 @@ def fit_frequency_baseline(
 ) -> Dict:
     """
     Basit frekans temelli model:
-      λ(GEOID, DOW, HOUR) ≈ (sayım) / (hafta_sayısı)
+      λ_weekly(GEOID, DOW, HOUR) ≈ (sayım + alpha) / (hafta_sayısı)
     Geri dönüş anahtarları:
-      - 'rate3': {(geoid,dow,hour)->λ}
-      - 'rate2': {(geoid,dow)->λ}
-      - 'rate1': {geoid->λ}
-      - 'rate0': float (şehir geneli)
+      - 'rate3': {(geoid,dow,hour)->λ_weekly}
+      - 'rate2': {(geoid,dow)->λ_weekly}
+      - 'rate1': {geoid->λ_weekly}
+      - 'rate0': float (şehir geneli, weekly)
       - 'weeks': float
       - 'horizon_days': int
     """
@@ -92,11 +154,10 @@ def fit_frequency_baseline(
     if y not in df.columns:
         df[y] = 1
 
-    # aktif gün -> yaklaşık hafta sayısı
     days_active = float(df["date"].dt.normalize().nunique()) if "date" in df.columns else float(horizon_days)
     weeks = max(1.0, days_active / 7.0)
 
-    # şehir geneli oran
+    # şehir geneli weekly oran
     rate0 = float(df[y].sum() + alpha) / weeks
 
     def grp_rate(keys: List[str]) -> Dict[Tuple, float]:
@@ -106,7 +167,6 @@ def fit_frequency_baseline(
             key_vals = []
             for k in keys:
                 v = row[k]
-                # GEOID'i stringe zorlayalım; diğeri olduğu gibi
                 key_vals.append(str(v) if k == "GEOID" and v is not None else v)
             out[tuple(key_vals)] = float(row[y] + alpha) / weeks
         return out
@@ -115,7 +175,7 @@ def fit_frequency_baseline(
     rate2 = grp_rate(["GEOID", "day_of_week"]) if "GEOID" in df.columns else {}
     rate3 = grp_rate(["GEOID", "day_of_week", "event_hour"]) if "GEOID" in df.columns else {}
 
-    # GEOID’i zayıf olanlara küçük itme
+    # Az gözlemi olan GEOID'lere zayıf itme
     if "GEOID" in df.columns:
         counts_geoid = df.groupby("GEOID", as_index=False)[y].sum().set_index("GEOID")[y].to_dict()
         for g, cnt in counts_geoid.items():
@@ -131,10 +191,19 @@ def fit_frequency_baseline(
         "horizon_days": int(horizon_days),
     }
 
-def predict_expected_baseline(df_raw: pd.DataFrame, model: Dict) -> pd.Series:
+def predict_expected_baseline(
+    df_raw: pd.DataFrame,
+    model: Dict,
+    scale: str = "per_slot",
+    slots_per_week: int = 7 * 24,
+) -> pd.Series:
     """
     Her satır için beklenen olay sayısı λ̂ döndürür.
     Öncelik: (GEOID,DOW,HOUR) → (GEOID,DOW) → (GEOID) → şehir.
+
+    scale:
+      - "weekly": model oranını haftalık olarak döndürür
+      - "per_slot": haftalık oranı 'slots_per_week' sayısına bölerek per-slot (≈ saatlik) beklenen üretir
     """
     df = _ensure_time(df_raw)
     r3, r2, r1 = model.get("rate3", {}), model.get("rate2", {}), model.get("rate1", {})
@@ -144,15 +213,12 @@ def predict_expected_baseline(df_raw: pd.DataFrame, model: Dict) -> pd.Series:
         geoid = str(df.at[i, "GEOID"]) if "GEOID" in df.columns else None
         dow   = int(df.at[i, "day_of_week"]) if "day_of_week" in df.columns else None
         hour  = int(df.at[i, "event_hour"]) if "event_hour" in df.columns else None
-        if geoid is None:
-            return r0
-        # arama sırası
-        k3 = (geoid, dow, hour)
-        k2 = (geoid, dow)
-        k1 = geoid
-        return float(r3.get(k3) or r2.get(k2) or r1.get(k1) or r0)
+        lam_week = float(r3.get((geoid, dow, hour)) or r2.get((geoid, dow)) or r1.get(geoid) or r0)
+        if scale == "weekly":
+            return lam_week
+        return lam_week / float(slots_per_week or 168)
 
-    return pd.Series({i: one_row(i) for i in df.index}, index=df.index, dtype=float)
+    return pd.Series({i: one_row(i) for i in df.index}, index=df.index, dtype=float).rename("pred_expected")
 
 # ---------------------------------------------------------------------
 # 2) Pencere-temelli baseline (p_proxy; 0..1)
