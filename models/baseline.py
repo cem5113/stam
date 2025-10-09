@@ -1,23 +1,49 @@
-# sutam/models/baseline.py
 from __future__ import annotations
 from typing import Dict, Tuple, Optional, List, Iterable
 import numpy as np
 import pandas as pd
+import importlib
+import types
 
-# --- Paket içi import (önerilen) ---
-try:
-    from .uncertainty import poisson_quantiles, prob_at_least_one
-except ImportError as e:
-    # Paket içi import başarısızsa (örn. streamlit çalışma yolu sapması)
+# ==== Uncertainty fonksiyonlarını sağlam şekilde içe al ====
+
+def _import_uncertainty():
+    """uncertainty modülünü hem göreli hem mutlak yollarla dener, bulunursa döndürür."""
+    # 1) Göreli dene
     try:
-        from sutam.models.uncertainty import poisson_quantiles, prob_at_least_one
+        from . import uncertainty as _unc  # type: ignore
+        return _unc
     except ImportError:
-        raise ImportError(
-            "uncertainty modülü bulunamadı. Şunları kontrol edin:\n"
-            "1) sutam/models/uncertainty.py mevcut mu?\n"
-            "2) sutam/ ve sutam/models/ içinde __init__.py var mı?\n"
-            "3) Uygulamayı proje kökünden çalıştırıyor musunuz? (cd /mount/src; streamlit run sutam/app.py)"
-        ) from e
+        pass
+
+    # 2) Mutlak dene
+    try:
+        _unc = importlib.import_module("sutam.models.uncertainty")
+        return _unc
+    except ImportError:
+        pass
+
+    raise ImportError(
+        "uncertainty modülü bulunamadı. Kontrol et:\n"
+        " - sutam/models/uncertainty.py mevcut mu?\n"
+        " - sutam/ ve sutam/models/ içinde __init__.py var mı?\n"
+        " - Projeyi kökten çalıştırıyor musun? (cd /mount/src; streamlit run sutam/app.py)"
+    )
+
+_unc = _import_uncertainty()
+
+# 3) İsimleri modülden çek ve doğrula
+poisson_quantiles = getattr(_unc, "poisson_quantiles", None)
+prob_at_least_one = getattr(_unc, "prob_at_least_one", None)
+
+if not callable(poisson_quantiles) or not callable(prob_at_least_one):
+    available = sorted([n for n in dir(_unc) if not n.startswith("_")])
+    raise ImportError(
+        "uncertainty modülü bulundu ama beklenen fonksiyon adları yok:\n"
+        " - Beklenen: poisson_quantiles, prob_at_least_one\n"
+        f" - Bulunan isimler: {available}\n"
+        "Lütfen uncertainty.py içindeki fonksiyonların adlarını birebir bu şekilde tanımlayın."
+    )
 
 # ---------------------------------------------------------------------
 # Yardımcılar
