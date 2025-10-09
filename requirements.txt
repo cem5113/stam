@@ -1,0 +1,14 @@
+# --- UI ---
+streamlit>=1.32,<1.39
+
+# --- Data & numerics ---
+pandas>=2.2,<2.3
+numpy>=1.26,<3
+pyarrow>=16,<18   
+
+# --- Timezones ---
+tzdata>=2024.1   
+pytz>=2024.1    
+
+# --- HTTP (opsiyonel) ---
+requests>=2.31,<3
