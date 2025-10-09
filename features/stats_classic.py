@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Dict, List
 # Yardımcılar
 # ---------------------------------------------------------------------
 def _pick_category_col(df: pd.DataFrame) -> Optional[str]:
-    for c in ["category_grouped", "category", "subcategory_grouped", "subcategory", "crime_type"]:
+    for c in ("category_grouped", "category", "subcategory_grouped", "subcategory", "crime_type"):
         if c in df.columns:
             return c
     return None
@@ -16,8 +16,8 @@ def _pick_category_col(df: pd.DataFrame) -> Optional[str]:
 def _score_col(df: pd.DataFrame) -> Optional[str]:
     """
     Skor kolonunu otomatik seç:
-    1) pred_expected  2) pred_p_occ (ortalama)  3) crime_count
-    Yoksa None döndür, sayım temelli fallback (_y_col) devreye girer.
+      1) pred_expected  2) pred_p_occ (ortalama)  3) crime_count
+    Yoksa None döndür → sayım temelli fallback (_y_col) çalışır.
     """
     if "pred_expected" in df.columns: return "pred_expected"
     if "pred_p_occ"   in df.columns:  return "pred_p_occ"
@@ -26,7 +26,7 @@ def _score_col(df: pd.DataFrame) -> Optional[str]:
 
 def _y_col(df: pd.DataFrame) -> str:
     """
-    Sayım temelli özetler için güvenli hedef kolon.
+    Sayım tabanlı özetler için güvenli hedef kolon.
     Yoksa her satırı 1 sayar.
     """
     for c in ("crime_count", "count", "y", "events"):
@@ -37,6 +37,7 @@ def _y_col(df: pd.DataFrame) -> str:
 
 def _ensure_time_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
     # date
     if "date" not in out.columns:
         if "datetime" in out.columns:
@@ -54,16 +55,23 @@ def _ensure_time_cols(df: pd.DataFrame) -> pd.DataFrame:
         if "datetime" in out.columns:
             out["event_hour"] = pd.to_datetime(out["datetime"], errors="coerce").dt.hour
         elif "date" in out.columns and pd.api.types.is_datetime64_any_dtype(out["date"]):
-            out["event_hour"] = out["date"].dt.hour.fillna(0).astype(int)
+            out["event_hour"] = out["date"].dt.hour
         else:
             out["event_hour"] = 0
 
-    # day_of_week
+    # day_of_week / day_name
     if "day_of_week" not in out.columns:
         if "date" in out.columns and pd.api.types.is_datetime64_any_dtype(out["date"]):
-            out["day_of_week"] = out["date"].dt.dayofweek
+            out["day_of_week"] = out["date"].dt.dayofweek  # 0=Mon
         else:
             out["day_of_week"] = 0
+    if "day_name" not in out.columns:
+        try:
+            out["day_name"] = out["date"].dt.day_name()
+        except Exception:
+            # Türkçe kısaltma fallback
+            dow_map = {0: "Pzt", 1: "Sal", 2: "Çar", 3: "Per", 4: "Cum", 5: "Cmt", 6: "Paz"}
+            out["day_name"] = out["day_of_week"].map(dow_map)
 
     # month
     if "month" not in out.columns:
@@ -71,6 +79,7 @@ def _ensure_time_cols(df: pd.DataFrame) -> pd.DataFrame:
             out["month"] = out["date"].dt.month
         else:
             out["month"] = 1
+
     return out
 
 def _apply_filters(
@@ -79,29 +88,32 @@ def _apply_filters(
     geoids: Optional[List[str]] = None,
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    out = df.copy()
+    out = _ensure_time_cols(df)
 
     # tarih aralığı
     if date_range and "date" in out.columns:
         d1, d2 = date_range
-        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        d1 = pd.to_datetime(d1) if d1 is not None else None
+        d2 = pd.to_datetime(d2) if d2 is not None else None
         if d1 is not None:
-            out = out[out["date"] >= pd.to_datetime(d1)]
+            out = out[out["date"] >= d1]
         if d2 is not None:
-            out = out[out["date"] <= pd.to_datetime(d2)]
+            out = out[out["date"] <= d2]
 
-    # geoid filtresi
+    # GEOID filtresi
     if geoids and "GEOID" in out.columns:
         out["GEOID"] = out["GEOID"].astype(str)
-        geoids = [str(g) for g in geoids]
-        out = out[out["GEOID"].isin(geoids)]
+        gset = set(map(str, geoids))
+        out = out[out["GEOID"].isin(gset)]
 
     # kategori filtresi (var olan ilk uygun kolon)
     if categories:
+        cats = set(map(str, categories))
         for c in ("category_grouped", "category", "subcategory_grouped", "subcategory", "crime_type"):
             if c in out.columns:
-                out = out[out[c].astype(str).isin([str(x) for x in categories])]
+                out = out[out[c].astype(str).isin(cats)]
                 break
+
     return out
 
 # ---------------------------------------------------------------------
@@ -109,37 +121,32 @@ def _apply_filters(
 # ---------------------------------------------------------------------
 def spatial_top_geoid(
     df_raw: pd.DataFrame,
-    n: int = 50,
+    n: int = 15,
     date_range: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    GEOID bazında en yüksek risk/yoğunluk listesi.
-    - Skor kolonları (pred_expected / pred_p_occ / crime_count) önceliklidir.
-      * pred_p_occ -> mean
-      * diğerleri  -> sum
-    - Skor kolonları yoksa, sayım temelli fallback (_y_col) ile sum.
-    - Tarih ve kategori filtreleri desteklenir.
+    GEOID bazında en yüksek risk/yoğunluk listesi döner.
+    Çıkış: ["GEOID", "value"]
+      * pred_p_occ → mean
+      * pred_expected / crime_count → sum
+      * hiçbir skor yoksa satır sayımı (fallback)
     """
-    d = _ensure_time_cols(df_raw)
-    d = _apply_filters(d, date_range, None, categories)
-
+    d = _apply_filters(df_raw, date_range, None, categories)
     if "GEOID" not in d.columns:
-        return pd.DataFrame(columns=["GEOID", "score"])
+        return pd.DataFrame(columns=["GEOID", "value"])
 
-    score = _score_col(d)
-    if score is None:
+    sc = _score_col(d)
+    if sc is None:
         y = _y_col(d)
-        g = d.groupby("GEOID", as_index=False)[y].sum().rename(columns={y: "score"})
+        g = d.groupby("GEOID", as_index=False)[y].sum().rename(columns={y: "value"})
     else:
-        if score == "pred_p_occ":
-            g = d.groupby("GEOID", as_index=False)[score].mean()
+        if sc == "pred_p_occ":
+            g = d.groupby("GEOID", as_index=False)[sc].mean().rename(columns={sc: "value"})
         else:
-            g = d.groupby("GEOID", as_index=False)[score].sum()
-        g = g.rename(columns={score: "score"})
+            g = d.groupby("GEOID", as_index=False)[sc].sum().rename(columns={sc: "value"})
 
-    g = g.sort_values("score", ascending=False).head(n).reset_index(drop=True)
-    return g
+    return g.sort_values("value", ascending=False).head(int(n)).reset_index(drop=True)
 
 def spatial_summary(
     df_raw: pd.DataFrame,
@@ -147,35 +154,25 @@ def spatial_summary(
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    GEOID başına temel özet: toplam skor/sayım, son tarih.
-    Skor kolonları yoksa sayım temelli fallback çalışır.
+    GEOID başına temel özet: toplam/ortalama skor ve son görülen tarih.
+    Çıkış: GEOID, score, (opsiyonel) crime_count, last_date
     """
     if "GEOID" not in df_raw.columns:
         return pd.DataFrame()
 
-    out = _ensure_time_cols(df_raw)
-    out = _apply_filters(out, date_range, None, categories)
-
-    score = _score_col(out)
+    out = _apply_filters(df_raw, date_range, None, categories)
+    sc = _score_col(out)
     agg: Dict[str, str] = {}
 
-    if score is None:
-        y = _y_col(out)
-        agg[y] = "sum"
+    if sc is None:
+        y = _y_col(out); agg[y] = "sum"
     else:
-        agg[score] = "mean" if score == "pred_p_occ" else "sum"
-        if "crime_count" in out.columns and score != "crime_count":
+        agg[sc] = "mean" if sc == "pred_p_occ" else "sum"
+        if "crime_count" in out.columns and sc != "crime_count":
             agg["crime_count"] = "sum"
 
     res = out.groupby("GEOID", as_index=False).agg(agg)
-
-    # skor kolonunu "score" ismine indir
-    if score is None:
-        res = res.rename(columns={_y_col(out): "score"})
-    else:
-        res = res.rename(columns={score: "score"})
-
-    res = res.sort_values("score", ascending=False)
+    res = res.rename(columns={(sc or _y_col(out)): "score"}).sort_values("score", ascending=False)
 
     if "date" in out.columns:
         last_seen = out.groupby("GEOID")["date"].max().rename("last_date")
@@ -192,12 +189,9 @@ def hourly_distribution(
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Saat 0–23 dağılımı (crime_count varsa sum; yoksa satır sayısı)."""
-    d = _ensure_time_cols(df_raw)
-    d = _apply_filters(d, date_range, geoids, categories)
-
+    d = _apply_filters(df_raw, date_range, geoids, categories)
     if "event_hour" not in d.columns:
         return pd.DataFrame({"event_hour": [], "value": []})
-
     y = "crime_count" if "crime_count" in d.columns else _y_col(d)
     g = d.groupby("event_hour", as_index=False)[y].sum().rename(columns={y: "value"})
     return g.sort_values("event_hour")
@@ -208,15 +202,14 @@ def dow_distribution(
     geoids: Optional[List[str]] = None,
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Haftanın günleri (0=Mon … 6=Sun) dağılımı."""
-    d = _ensure_time_cols(df_raw)
-    d = _apply_filters(d, date_range, geoids, categories)
-
+    """Haftanın günleri (0=Mon … 6=Sun) dağılımı + gün adı."""
+    d = _apply_filters(df_raw, date_range, geoids, categories)
     if "day_of_week" not in d.columns:
-        return pd.DataFrame({"day_of_week": [], "value": []})
-
+        return pd.DataFrame({"day_of_week": [], "day_name": [], "value": []})
     y = "crime_count" if "crime_count" in d.columns else _y_col(d)
     g = d.groupby("day_of_week", as_index=False)[y].sum().rename(columns={y: "value"})
+    dow_map = {0:"Pzt",1:"Sal",2:"Çar",3:"Per",4:"Cum",5:"Cmt",6:"Paz"}
+    g["day_name"] = g["day_of_week"].map(dow_map)
     return g.sort_values("day_of_week")
 
 def heatmap_day_hour(
@@ -226,15 +219,12 @@ def heatmap_day_hour(
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Gün(0–6) × saat(0–23) matrisi — pivot tablo.
-    crime_count varsa sum; yoksa satır sayısı üzerinden.
+    Gün(0–6) × saat(0–23) matrisi — haftanın günü bazlı.
+    (UI’de gün-tarih bazlı ısı isteniyorsa `time_distributions` içindeki 'heat' kullanılır.)
     """
-    d = _ensure_time_cols(df_raw)
-    d = _apply_filters(d, date_range, geoids, categories)
-
+    d = _apply_filters(df_raw, date_range, geoids, categories)
     if "event_hour" not in d.columns or "day_of_week" not in d.columns:
         return pd.DataFrame()
-
     y = "crime_count" if "crime_count" in d.columns else _y_col(d)
     p = (d.groupby(["day_of_week", "event_hour"], as_index=False)[y].sum()
            .pivot(index="day_of_week", columns="event_hour", values=y)
@@ -250,9 +240,7 @@ def type_distribution(
     categories: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Suç türleri (category*) dağılımı — ilk 20."""
-    d = _ensure_time_cols(df_raw)
-    d = _apply_filters(d, date_range, None, categories)
-
+    d = _apply_filters(df_raw, date_range, None, categories)
     col = _pick_category_col(d)
     if not col:
         return pd.DataFrame(columns=["type", "value"])
@@ -265,7 +253,7 @@ def type_distribution(
     return g.sort_values("value", ascending=False).head(20).reset_index(drop=True)
 
 # ---------------------------------------------------------------------
-# Kapsayıcı özet (hepsi bir arada)
+# Kapsayıcı özet (UI uyumlu)
 # ---------------------------------------------------------------------
 def time_distributions(
     df_raw: pd.DataFrame,
@@ -274,10 +262,13 @@ def time_distributions(
     categories: Optional[List[str]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Saat / gün / ay dağılımları ve gün×saat ısı matrisi döner.
+    Saat / gün / (opsiyonel ay) dağılımları ve **tarih × saat** ısı matrisi döner.
+    UI beklentileri:
+      - by_hour:   ["event_hour","value"]
+      - by_dow:    ["day_of_week","day_name","value"]
+      - heat:      index=tarih (day), columns=hour(0..23)
     """
-    df = _ensure_time_cols(df_raw)
-    df = _apply_filters(df, date_range, geoids, categories)
+    df = _apply_filters(df_raw, date_range, geoids, categories)
     y = _y_col(df)
 
     # Saatlik
@@ -285,23 +276,29 @@ def time_distributions(
                  .rename(columns={y: "value"})
                  .sort_values("event_hour"))
 
-    # Gün (0=Mon)
-    dow_map = {0:"Pzt",1:"Sal",2:"Çar",3:"Per",4:"Cum",5:"Cmt",6:"Paz"}
+    # Gün (0=Mon) + isim
     by_dow = (df.groupby("day_of_week", as_index=False)[y].sum()
                 .rename(columns={y: "value"}))
+    dow_map = {0:"Pzt",1:"Sal",2:"Çar",3:"Per",4:"Cum",5:"Cmt",6:"Paz"}
     by_dow["day_name"] = by_dow["day_of_week"].map(dow_map)
     by_dow = by_dow.sort_values("day_of_week")
 
-    # Ay
+    # Ay (opsiyonel; bazı UI'lar kullanmıyor)
     by_month = (df.groupby("month", as_index=False)[y].sum()
                   .rename(columns={y: "value"})
                   .sort_values("month"))
 
-    # Gün×saat ısı matrisi
-    heat = (df.groupby(["day_of_week","event_hour"], as_index=False)[y].sum()
-              .pivot(index="day_of_week", columns="event_hour", values=y))
-    heat = heat.reindex(index=sorted(dow_map.keys()), columns=sorted(df["event_hour"].unique()))
-    heat.index = [dow_map.get(i, i) for i in heat.index]
+    # Tarih × saat ısı matrisi (UI: son 7 günü .iloc[-7:,:] ile kullanıyor)
+    heat = (df.assign(day=df["date"].dt.date)
+              .groupby(["day", "event_hour"], as_index=False)[y].sum()
+              .pivot(index="day", columns="event_hour", values=y)
+              .sort_index())
+
+    # tüm saat kolonlarını 0..23 tamamla
+    for h in range(24):
+        if h not in heat.columns:
+            heat[h] = 0
+    heat = heat.reindex(sorted(heat.columns), axis=1)
 
     return {"by_hour": by_hour, "by_dow": by_dow, "by_month": by_month, "heat": heat}
 
@@ -310,16 +307,15 @@ def offense_breakdown(
     date_range: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
 ) -> pd.DataFrame:
     """
-    Tür bazında (ilk uygun kategori kolonunda) toplam sayım.
+    Tür bazında toplam (ilk uygun kategori kolonu).
+    Çıkış: ["offense","value"]
     """
-    df = _ensure_time_cols(df_raw)
-    df = _apply_filters(df, date_range, None, None)
+    df = _apply_filters(df_raw, date_range, None, None)
     y = _y_col(df)
-    for c in ("category_grouped","category","subcategory_grouped","subcategory","crime_type"):
+    for c in ("category_grouped", "category", "subcategory_grouped", "subcategory", "crime_type"):
         if c in df.columns:
             bk = (df.groupby(c, as_index=False)[y].sum()
-                    .rename(columns={y:"value"})
+                    .rename(columns={y: "value"})
                     .sort_values("value", ascending=False))
-            bk = bk.rename(columns={c: "offense"})
-            return bk
-    return pd.DataFrame(columns=["offense","value"])
+            return bk.rename(columns={c: "offense"})
+    return pd.DataFrame(columns=["offense", "value"])
