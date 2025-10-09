@@ -1,4 +1,4 @@
-# models/predictor.py
+# sutam/models/predictor.py
 from __future__ import annotations
 import pandas as pd
 import numpy as np
@@ -7,17 +7,20 @@ from typing import Optional, Dict, Any, List
 # Paket içi importlar
 from .baseline import (
     BaselineModel,
-    fit_mean_by_groups, predict_mean_by_groups,
-    fit_frequency_baseline, predict_expected_baseline,
+    fit_mean_by_groups,
+    predict_mean_by_groups,
+    fit_frequency_baseline,
+    predict_expected_baseline,
 )
-# Basit Poisson baseline (mevcutsa kullanacağız)
+
+# Basit Poisson baseline (opsiyonel)
 try:
     from .baseline import baseline_expected as _baseline_expected
 except Exception:
-    _baseline_expected = None  # opsiyonel
+    _baseline_expected = None  # baseline_expected tanımlı değilse None ata
 
+# Belirsizlik fonksiyonları (poisson quantiles vb.)
 from .uncertainty import add_poisson_uncertainty, lambda_to_p_occ
-
 # ---------------------------------------------------------------------
 # Yardımcılar
 # ---------------------------------------------------------------------
