@@ -1,14 +1,22 @@
-# ui/tab_reports.py
+# ui/tab_reports.py (revize)
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional
+from pathlib import Path
 
 from dataio.loaders import load_sf_crime_latest
 from patrol.approvals import list_approvals
 from features.stats_classic import time_distributions, spatial_top_geoid, offense_breakdown
 from reports.builder import approvals_to_df, frames_to_csv_bytes, pack_zip
+# Hızlı ZIP sarmalayıcıları (varsa)
+try:
+    from reports.daily import export_daily_zip
+    from reports.weekly import export_weekly_zip
+    from reports.monthly import export_monthly_zip
+except Exception:
+    export_daily_zip = export_weekly_zip = export_monthly_zip = None
 
 # (opsiyonel) geçici hotspot; yoksa sessiz atla
 try:
@@ -31,9 +39,9 @@ def _category_col(df: pd.DataFrame) -> Optional[str]:
 
 def _period_to_range(period: str, ref: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
     ref = pd.to_datetime(ref).normalize()
-    if period.startswith("Gün"):  start, end = ref, ref
+    if period.startswith("Gün"):   start, end = ref, ref
     elif period.startswith("Haft"): start, end = ref - pd.Timedelta(days=6), ref
-    else:                          start, end = ref - pd.Timedelta(days=29), ref
+    else:                           start, end = ref - pd.Timedelta(days=29), ref
     return start, end
 
 def _slice_df(df: pd.DataFrame, d1: pd.Timestamp, d2: pd.Timestamp,
@@ -161,8 +169,8 @@ def render():
             st.dataframe(top_geo, use_container_width=True, height=220)
             sums = time_distributions(df_win)
             st.caption("Saatlik dağılım"); st.line_chart(sums["by_hour"].set_index("event_hour"))
-            st.caption("Gün × saat ısı (son 7 gün)"); st.dataframe(sums["heat"].fillna(0).iloc[-7:, :],
-                                                                  use_container_width=True, height=180)
+            st.caption("Gün × saat ısı (son 7 gün)")
+            st.dataframe(sums["heat"].fillna(0).iloc[-7:, :], use_container_width=True, height=180)
 
     # --- Sağ: öneriler + indirme
     with right:
@@ -184,7 +192,7 @@ def render():
                 st.write("• " + s)
 
             st.markdown("---")
-            st.markdown("**Rapor Çıkışı**")
+            st.markdown("**Rapor Çıkışı (CSV ZIP)**")
 
             files: Dict[str, pd.DataFrame] = {}
             # approvals
@@ -197,11 +205,11 @@ def render():
                 files["by_dow.csv"] = sums["by_dow"]
                 files["heatmatrix.csv"] = sums["heat"].reset_index().rename(columns={"index":"day"})
                 files["offense_breakdown.csv"] = br
-                files["top{}_geoid.csv".format(int(k))] = spatial_top_geoid(df_win, n=int(k))
+                files[f"top{int(k)}_geoid.csv"] = spatial_top_geoid(df_win, n=int(k))
             except Exception:
                 pass
 
-            # Top-K tablo + öneriler ekle
+            # Top-K + öneriler
             out_sugg = topk[["GEOID", score_col, "risk_norm", "planned", "temp_score"]].copy()
             out_sugg["suggestion"] = out_sugg.apply(
                 lambda r: _suggest_for_geoid(
@@ -223,6 +231,36 @@ def render():
                 mime="application/zip",
                 use_container_width=True
             )
+
+            # Hazır sarmalayıcılar (varsa)
+            if any([export_daily_zip, export_weekly_zip, export_monthly_zip]):
+                st.markdown("---")
+                st.markdown("**Hızlı ZIP Dışa Aktarım**")
+                c1, c2, c3 = st.columns(3)
+                if export_daily_zip and c1.button("📦 Günlük ZIP"):
+                    path = export_daily_zip(df_raw, end=d2, cats=(pick_cats or None))
+                    st.success(f"Kaydedildi: {path}")
+                    try:
+                        st.download_button("⬇️ Günlük ZIP indir", data=Path(path).read_bytes(),
+                                           file_name=Path(path).name, mime="application/zip")
+                    except Exception:
+                        pass
+                if export_weekly_zip and c2.button("📦 Haftalık ZIP"):
+                    path = export_weekly_zip(df_raw, end=d2, cats=(pick_cats or None))
+                    st.success(f"Kaydedildi: {path}")
+                    try:
+                        st.download_button("⬇️ Haftalık ZIP indir", data=Path(path).read_bytes(),
+                                           file_name=Path(path).name, mime="application/zip")
+                    except Exception:
+                        pass
+                if export_monthly_zip and c3.button("📦 Aylık ZIP"):
+                    path = export_monthly_zip(df_raw, end=d2, cats=(pick_cats or None))
+                    st.success(f"Kaydedildi: {path}")
+                    try:
+                        st.download_button("⬇️ Aylık ZIP indir", data=Path(path).read_bytes(),
+                                           file_name=Path(path).name, mime="application/zip")
+                    except Exception:
+                        pass
 
     st.caption(
         f"Aralık (SF): {d1.strftime('%Y-%m-%d')} → {d2.strftime('%Y-%m-%d')} • "
