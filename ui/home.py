@@ -34,32 +34,49 @@ def _pick_meta(meta: dict) -> tuple[str, str, str]:
     return str(mv), str(ltr), str(ldr)
 
 
+def _get_secret_or_env(key: str, default: str | None = None) -> str | None:
+    """Streamlit secrets > ENV fallback."""
+    try:
+        if key in st.secrets:
+            v = st.secrets.get(key, default)  # type: ignore[attr-defined]
+            return str(v) if v is not None else default
+    except Exception:
+        pass
+    v = os.getenv(key, default)
+    return str(v) if v is not None else None
+
+
 def _trigger_pipeline() -> tuple[int, str]:
     """
     GitHub Actions workflow'u manuel tetikler (opsiyonel).
     Gerekli secrets/env: GH_TOKEN, GITHUB_REPO, GITHUB_WORKFLOW
     """
-    repo = os.getenv("GITHUB_REPO")
-    wf   = os.getenv("GITHUB_WORKFLOW", "full_pipeline.yml")
-    tok  = os.getenv("GH_TOKEN")
+    repo = _get_secret_or_env("GITHUB_REPO", "cem5113/crime_prediction_data")
+    wf   = _get_secret_or_env("GITHUB_WORKFLOW", "full_pipeline.yml")
+    tok  = _get_secret_or_env("GH_TOKEN", None)
 
-    if not (repo and wf and tok):
-        return 400, "GITHUB_REPO / GITHUB_WORKFLOW / GH_TOKEN ayarlı değil."
+    if not tok:
+        return 400, "GH_TOKEN bulunamadı. Lütfen Streamlit secrets'e (veya ENV) GH_TOKEN ekleyin."
+    if not repo or not wf:
+        return 400, "GITHUB_REPO / GITHUB_WORKFLOW ayarlı değil."
 
     try:
-        import requests  # istek sırasında import; yoksa yakalarız
+        import requests  # isteğe özel import
     except Exception:
-        return 400, "requests modülü yok. Bu özelliği kullanmak için requests kurulmalı."
+        return 400, "requests modülü yok. requirements.txt içine 'requests' ekleyin."
 
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches"
     try:
         r = requests.post(
             url,
-            json={"ref": "main", "inputs": {"note": "Streamlit Home'dan el ile tetiklendi"}},
+            json={"ref": "main", "inputs": {"note": "Streamlit Home'dan el ile tetiklendi", "dry_run": False}},
             headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
             timeout=30,
         )
-        return r.status_code, (r.text or "OK")
+        # 201/204 genelde başarılıdır
+        if r.status_code in (201, 204):
+            return r.status_code, "OK"
+        return r.status_code, (r.text or "Başlatılamadı")
     except Exception as e:
         return 500, f"İstek hatası: {e}"
 
@@ -68,7 +85,6 @@ def render():
     st.title(APP_NAME)
 
     # --- Meta ---
-    meta = {}
     try:
         meta = load_metadata() or {}
     except Exception:
@@ -92,7 +108,7 @@ def render():
     if colA.button("⟳ Veriyi yeniden yükle", use_container_width=True):
         # Streamlit cache temizle → bir sonraki okuma taze veri
         try:
-            st.cache_data.clear()
+            st.cache_data.clear()  # type: ignore[attr-defined]
         except Exception:
             pass
         # İsteğe bağlı: hemen okuma yapıp kullanıcıya bildirelim
@@ -106,12 +122,14 @@ def render():
     if colB.button("▶️ Full Data Pipeline’ı çalıştır", use_container_width=True):
         code, msg = _trigger_pipeline()
         if 200 <= code < 300:
-            st.success("Workflow tetiklendi. GitHub Actions'dan ilerlemeyi izleyebilirsiniz.")
+            st.success("✅ Workflow tetiklendi. GitHub Actions üzerinden ilerlemeyi izleyebilirsiniz.")
         else:
-            st.error(f"Tetikleme başarısız: {code}\n{msg}")
+            st.error(f"❌ Tetikleme başarısız: {code}\n{msg}")
 
-    st.caption("Not: ‘Veriyi yeniden yükle’ sadece cache’i boşaltır ve mevcut artefact/kaynakları tekrar okutur. "
-               "‘Pipeline’ ise ham veriyi toplayıp özellik/tahmin/rapor artefact’larını baştan üretir (opsiyonel).")
+    st.caption(
+        "Not: ‘Veriyi yeniden yükle’ cache’i boşaltır ve mevcut artefact/kaynakları tekrar okutur. "
+        "‘Pipeline’ ise ham veriyi toplayıp özellik/tahmin/rapor artefact’larını yeniden üretir (opsiyonel)."
+    )
     st.markdown("---")
 
     # --- Veri yükleme + KPI ---
@@ -127,10 +145,9 @@ def render():
     s1, s2, s3 = st.columns(3)
     s1.metric("HitRate@Top10", "—" if kpi["hitrate_top10"] is None else f"{kpi['hitrate_top10']}%")
     s2.metric("Brier", "—" if kpi["brier"] is None else f"{kpi['brier']}")
-    # Kaynak etiketi (path'i sadeleştir)
-    src_label = str(src)
-    if isinstance(src_label, str) and src_label.startswith(("results/", "out/")):
-        src_label = src_label
+
+    # Kaynak etiketi
+    src_label = {"artifact": "Artifact (güncel)", "release": "Release (yedek)"}.get(str(src), str(src))
     s3.metric("Veri Kaynağı", src_label)
 
     # Mini Model Kartı
@@ -149,8 +166,8 @@ def render():
 
     # Hızlı kontroller (yer tutucu)
     st.markdown("#### Hızlı kontroller")
-    colA, colB, colC = st.columns(3)
-    colA.toggle("Tahmin katmanı (risk)", value=True, help="Açılışta risk haritası görünür.")
-    colB.toggle("Geçici hotspot", value=True, help="Son olaylara dayalı anomali noktaları.")
-    colC.toggle("Kalıcı hotspot", value=True, help="Uzun dönem ısı haritası.")
+    col1, col2, col3 = st.columns(3)
+    col1.toggle("Tahmin katmanı (risk)", value=True, help="Açılışta risk haritası görünür.")
+    col2.toggle("Geçici hotspot", value=True, help="Son olaylara dayalı anomali noktaları.")
+    col3.toggle("Kalıcı hotspot", value=True, help="Uzun dönem ısı haritası.")
     st.caption("🔌 Katmanlar ileride haritaya bağlanacak. KPI'lar güncel veriden otomatik hesaplanır.")
