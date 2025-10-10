@@ -1,0 +1,111 @@
+name: full_pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "Neden tetikledin? (opsiyonel)"
+        required: false
+      dry_run:
+        description: "Sadece çalıştır, commit etme"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # results/ içine commit edebilmek için
+
+concurrency:
+  group: full_pipeline
+  cancel-in-progress: true
+
+jobs:
+  build-train-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          if [ -d tests ]; then pytest -q; else echo "no tests"; fi
+
+      - name: Run pipeline (predict + reports)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import os, json, shutil
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          from dataio.loaders import load_sf_crime_latest
+          from models.predictor import ensure_predictions
+          from reports.daily import   export_daily_zip
+          from reports.weekly import  export_weekly_zip
+          from reports.monthly import export_monthly_zip
+
+          df, src = load_sf_crime_latest()
+          df = ensure_predictions(df)
+
+          # Rapor ZIP'leri
+          p_daily   = export_daily_zip(df)
+          p_weekly  = export_weekly_zip(df)
+          p_monthly = export_monthly_zip(df)
+
+          res = Path("results"); res.mkdir(parents=True, exist_ok=True)
+          for p in [p_daily, p_weekly, p_monthly]:
+              if p:
+                  p = Path(p)
+                  if p.exists():
+                      shutil.copy2(p, res / p.name)
+
+          meta = {
+              "model_version": f"git-{os.environ.get('GITHUB_SHA','')[:7]}",
+              "last_trained_at":      datetime.now(timezone.utc).isoformat(),
+              "last_data_refresh_at": datetime.now(timezone.utc).isoformat(),
+          }
+          (res / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+          print("Artifacts in results/:", [x.name for x in res.iterdir()])
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sutam-results
+          path: |
+            results/**
+            out/**
+
+      - name: Commit results back to repo (optional)
+        if: ${{ github.ref == 'refs/heads/main' && inputs.dry_run != true }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/
+          if ! git diff --cached --quiet; then
+            git commit -m "CI: update results ($(date -u +'%Y-%m-%dT%H:%MZ'))${{ inputs.note && format(' — {0}', inputs.note) || '' }}"
+            git push
+          else
+            echo "No changes to commit."
+          fi
