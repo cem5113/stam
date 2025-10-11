@@ -45,23 +45,18 @@ def _get_secret_or_env(key: str, default: str | None = None) -> str | None:
     v = os.getenv(key, default)
     return str(v) if v is not None else None
 
-
 def _trigger_pipeline() -> tuple[int, str]:
-    """
-    GitHub Actions workflow'u manuel tetikler (opsiyonel).
-    Gerekli secrets/env: GH_TOKEN, GITHUB_REPO, GITHUB_WORKFLOW
-    """
-    repo = _get_secret_or_env("GITHUB_REPO", "cem5113/crime_prediction_data")
-    wf   = _get_secret_or_env("GITHUB_WORKFLOW", "full_pipeline.yml")
-    tok  = _get_secret_or_env("GH_TOKEN", None)
+    import os
+    repo = os.getenv("GITHUB_REPO")
+    wf   = os.getenv("GITHUB_WORKFLOW", "full_pipeline.yml")
+    tok  = os.getenv("GH_TOKEN")
+    ref  = os.getenv("GITHUB_REF_TO_DISPATCH", "main")  # default branch'iniz master ise burayı 'master' yapın
 
-    if not tok:
-        return 400, "GH_TOKEN bulunamadı. Lütfen Streamlit secrets'e (veya ENV) GH_TOKEN ekleyin."
-    if not repo or not wf:
-        return 400, "GITHUB_REPO / GITHUB_WORKFLOW ayarlı değil."
+    if not (repo and wf and tok):
+        return 400, "GITHUB_REPO / GITHUB_WORKFLOW / GH_TOKEN ayarlı değil."
 
     try:
-        import requests  # isteğe özel import
+        import requests
     except Exception:
         return 400, "requests modülü yok. requirements.txt içine 'requests' ekleyin."
 
@@ -69,17 +64,16 @@ def _trigger_pipeline() -> tuple[int, str]:
     try:
         r = requests.post(
             url,
-            json={"ref": "main", "inputs": {"note": "Streamlit Home'dan el ile tetiklendi", "dry_run": False}},
-            headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
+            json={"ref": ref},             # 👈 inputs YOK
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Accept": "application/vnd.github+json",
+            },
             timeout=30,
         )
-        # 201/204 genelde başarılıdır
-        if r.status_code in (201, 204):
-            return r.status_code, "OK"
-        return r.status_code, (r.text or "Başlatılamadı")
+        return r.status_code, (r.text or "OK")
     except Exception as e:
         return 500, f"İstek hatası: {e}"
-
 
 def render():
     st.title(APP_NAME)
