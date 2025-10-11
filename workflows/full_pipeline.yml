@@ -6,13 +6,14 @@ on:
       note:
         description: "Neden tetikledin? (opsiyonel)"
         required: false
+        default: ""
       dry_run:
         description: "Sadece çalıştır, commit etme"
         type: boolean
         default: false
 
 permissions:
-  contents: write   # results/ içine commit edebilmek için
+  contents: write   # results/ içine commit atabilmek için
 
 concurrency:
   group: full_pipeline
@@ -53,6 +54,9 @@ jobs:
       - name: Run pipeline (predict + reports)
         env:
           PYTHONUNBUFFERED: "1"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}          # loaders.py artifact erişimi için
+          GITHUB_REPO: ${{ github.repository }}          # owner/repo
+          GITHUB_ARTIFACT_NAME: sutam-results            # loaders.py ile uyumlu
         run: |
           python - <<'PY'
           import os, json, shutil
@@ -98,13 +102,13 @@ jobs:
             out/**
 
       - name: Commit results back to repo (optional)
-        if: ${{ github.ref == 'refs/heads/main' && inputs.dry_run != true }}
+        if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.dry_run != 'true' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add results/
           if ! git diff --cached --quiet; then
-            git commit -m "CI: update results ($(date -u +'%Y-%m-%dT%H:%MZ'))${{ inputs.note && format(' — {0}', inputs.note) || '' }}"
+            git commit -m "CI: update results ($(date -u +'%Y-%m-%dT%H:%MZ'))${{ github.event.inputs.note && format(' — {0}', github.event.inputs.note) || '' }}"
             git push
           else
             echo "No changes to commit."
